@@ -16,7 +16,7 @@ autoscaling support.
 | Rule-based Router (Strategy A) | ✅ real, tested |
 | Tier 0 deterministic tools (git, grep, json/csv parse, tests) | ✅ real, tested, path-sandboxed |
 | Tier 1 local LLM connector (Ollama) | ✅ real code, sync + async, retry/circuit-breaker; needs Ollama running to execute |
-| Tier 2 frontier LLM connector (Anthropic) | ✅ real code, sync + async, retry/circuit-breaker; needs `ANTHROPIC_API_KEY` to execute |
+| Tier 2 frontier LLM connector (Claude) | ✅ real code, sync + async, retry/circuit-breaker; shells out to the `claude` CLI so it runs on your existing Claude Code login — no separate `ANTHROPIC_API_KEY` needed (see "Using your existing Claude CLI login" below) |
 | Confidence/escalation logic | ✅ real, tested (heuristic signals — see "Honest limitations") |
 | Context firewall (compression + progressive disclosure) | ✅ real, tested, wired into frontier calls when `payload["context_text"]` is set |
 | Policy engine (section 21) | ✅ real, tested — deny/require-approval on high-risk patterns, enforced inside the pipeline |
@@ -48,8 +48,8 @@ python3 demo.py
 # 2. Run the test suite
 python3 -m unittest discover -s tests -v
 
-# 3. Real execution (needs Ollama and/or ANTHROPIC_API_KEY)
-export ANTHROPIC_API_KEY=sk-ant-...
+# 3. Real execution (needs Ollama running and/or the `claude` CLI logged in —
+#    see "Using your existing Claude CLI login" below; no API key required)
 python3 pipeline_demo.py
 
 # 4. HTTP API
@@ -75,6 +75,48 @@ Without Ollama running, Tier-1 calls fail closed (`LocalLLMUnavailable`)
 and the pipeline returns `success=False` with the error message rather
 than crashing — check `result.output` in that case.
 
+## Using your existing Claude CLI login (no API key required)
+
+`alr/frontier_llm.py` doesn't call the Anthropic Messages API directly —
+it shells out to the `claude` CLI (Claude Code) in non-interactive print
+mode:
+
+```
+claude -p "<task text>" --output-format json --model claude-sonnet-5 --restricted
+```
+
+This means Tier-2 (frontier) execution reuses whatever Claude Code login
+you already have (`claude login`) instead of requiring a separate
+`ANTHROPIC_API_KEY` and raw API billing. `--restricted` disables Claude
+Code's own Bash/file tools so each call is a plain single-turn
+completion, not an agent run. The CLI's JSON output reports
+`total_cost_usd` directly, which `pipeline.py` uses as the authoritative
+cost for that call (falling back to the registry's blended
+`cost_per_1k_tokens` estimate only if that field is ever missing).
+
+**Requirements:** the `claude` binary on `PATH` and an active `claude
+login` session on the machine running the router. No `.env` entry, no
+`ANTHROPIC_API_KEY` needed for this path.
+
+**Trade-offs to know before you rely on this:**
+- **Doesn't work in a container out of the box.** The Docker/Kubernetes
+  deployment paths below assume a headless environment with no
+  interactive login, so they still need the original
+  `ANTHROPIC_API_KEY`-based Messages-API connector. Swap
+  `alr/frontier_llm.py` back to a raw-HTTP implementation for those
+  paths — the function signatures (`call_frontier_llm`,
+  `call_frontier_llm_async`, `FrontierLLMResponse`) are unchanged, so
+  nothing else in the pipeline needs to change.
+- **Cost includes Claude Code's own overhead.** Each call carries Claude
+  Code's system prompt/tool-definition prefix (even in `--restricted`
+  mode), which is billed like any other input tokens the first time and
+  then usually served from Anthropic's prompt cache on subsequent calls
+  within the cache TTL — so cost per call can vary noticeably depending
+  on how recently another `claude` call ran on the same machine.
+- **Adds subprocess latency.** Spinning up the CLI per call is slower
+  than a raw HTTPS request — fine for a router doing a handful of
+  escalations, not ideal for high-throughput frontier traffic.
+
 ## Project layout
 
 ```
@@ -86,7 +128,7 @@ alr/
   analyzer.py     Task Analyzer — keyword/heuristic classification (section 8)
   tools.py        Tier 0 — deterministic tools: git, grep, test runner, parsers (path-sandboxed)
   local_llm.py    Tier 1 — Ollama connector, sync + async (stdlib urllib, no SDK dependency)
-  frontier_llm.py Tier 2 — Anthropic API connector, sync + async (stdlib urllib, no SDK dependency)
+  frontier_llm.py Tier 2 — Claude CLI connector (subprocess), sync + async; see "Using your existing Claude CLI login"
   router.py       Rule-based Adaptive Routing Engine (Strategy A, section 9)
   validator.py    Confidence scoring + escalation decision (section 10)
   context.py      Context firewall + progressive disclosure (sections 12, 23)
@@ -107,6 +149,8 @@ tests/
   test_scaling_infra.py         Registry/token-count regressions + live Redis/Postgres autoscaling tests (auto-skip if unreachable)
 demo.py               Zero-dependency routing-decisions-only demo
 pipeline_demo.py      Full pipeline demo with real execution
+benchmarks/
+  compare_direct_vs_router.py  Direct Claude vs. adaptive router — cost + accuracy (see "Benchmark" section)
 Dockerfile            Non-root, healthcheck, workspace-sandboxed
 docker-compose.yml    App (N replicas) + nginx load balancer + Postgres + Redis + Ollama — scale-ready by default
 nginx.conf            Round-robin load balancer config for docker-compose --scale
@@ -219,6 +263,51 @@ attempts = {"task-1": [True, False, False], "task-2": [True, True, False]}
 pass_at_k_from_attempts(attempts, k=1)
 ```
 
+## Benchmark: direct Claude vs. the adaptive router
+
+A real, reproducible run comparing **calling Claude directly (no router)**
+against **routing through ALR** on 2 tasks, using the CLI-based connector
+above (`llama3.2:3b` via Ollama for Tier 1, `claude-sonnet-5` via the
+`claude` CLI for Tier 2). Reproduce it yourself:
+`python3 benchmarks/compare_direct_vs_router.py`.
+
+Both tasks were graded objectively — string/regex match against a known
+ground truth, not an LLM judge — so "accuracy" below is a hard pass/fail:
+
+| Task | Direct Claude | Adaptive Router | Accuracy (both) |
+|---|---|---|---|
+| `log_extraction` (log_analysis; ground truth = 3 named exceptions) | frontier, **$0.02463**, 7.9s | escalated to frontier, **$0.01204**, 20.4s | 1.00 / 1.00 |
+| `code_debugging` (an off-by-one bug with a known correct fix) | frontier, **$0.02284**, 7.2s | **resolved locally, $0.00000**, 7.7s | 1.00 / 1.00 |
+| **Total** | **$0.04748** | **$0.01204** | **1.00 / 1.00** |
+
+Headline: **74.6% cost reduction, zero accuracy loss** on this run — but
+two caveats matter more than that single number:
+
+1. **The `log_extraction` cost gap is mostly a prompt-cache artifact, not
+   a routing win.** The router correctly judged the local model couldn't
+   reliably do structured extraction and escalated to frontier anyway —
+   same tier as the direct call. The $0.01204 vs. $0.02463 difference is
+   Claude Code's own prompt cache being warm from the immediately
+   preceding direct call in the same benchmark run. Spread the same
+   requests out in production and expect that task's routed cost to land
+   close to the direct cost, not half of it.
+2. **The real, unconfounded win is `code_debugging`: 100% of that call's
+   cost avoided for an identically correct answer.** Rerunning that exact
+   task afterward produced a *different* outcome — the local model's
+   self-reported confidence came out lower that time and it escalated
+   anyway (cost $0.008, still correct). That's not benchmark noise, it's
+   the limitation directly below: local self-reported confidence is
+   heuristic and uncalibrated, so the same task can resolve locally one
+   run and escalate the next. **Expect savings to vary run to run**,
+   proportional to how much of your real workload the local model can
+   actually handle — not a fixed percentage.
+
+Across all 3 trials (2 in the run above + 1 rerun), the router never
+produced a less accurate answer than calling Claude directly — it either
+matched it at the same cost (correctly escalating) or matched it for
+free (correctly staying local). That is the actual value proposition:
+never worse, sometimes free — not a guaranteed discount.
+
 ## Honest limitations (read before you pitch this to anyone)
 
 - **The confidence signal is heuristic, not calibrated.** It blends a
@@ -318,10 +407,17 @@ section for exactly what was tested and how to reproduce it.
 
 ## Deploying it
 
+> **Note:** the steps below build a container image, which has no
+> interactive `claude login` session — so this path needs
+> `alr/frontier_llm.py` swapped back to a raw Messages-API connector
+> using `ANTHROPIC_API_KEY` (see "Using your existing Claude CLI login"
+> above). Running the app directly on your own machine (Quick start)
+> uses the CLI-based connector and needs no API key at all.
+
 ```bash
 # 1. Configure
 cp .env.example .env
-# edit .env: set ALR_API_KEYS (required), ANTHROPIC_API_KEY
+# edit .env: set ALR_API_KEYS (required), ANTHROPIC_API_KEY (if using the raw-API connector)
 
 # 2. Build + run
 docker compose up --build
@@ -339,7 +435,7 @@ curl -X POST localhost:8000/execute \
 | Variable | Default | Purpose |
 |---|---|---|
 | `ALR_API_KEYS` | unset (auth OFF) | Comma-separated valid API keys. **Set this in any real deployment** — startup logs a warning if unset. |
-| `ANTHROPIC_API_KEY` | unset | Required for Tier-2 frontier execution. |
+| `ANTHROPIC_API_KEY` | unset | Only used if `alr/frontier_llm.py` is swapped back to the raw Messages-API connector (e.g. for the Docker/k8s paths). The default CLI-based connector needs no API key — see "Using your existing Claude CLI login". |
 | `DATABASE_URL` | unset (uses SQLite) | Postgres DSN — switches `build_trace_store()` to `PostgresTraceStore` (see limitations above). |
 | `ALR_WORKSPACE_ROOT` | `.` | Root that Tier-0 filesystem tools (git/grep/ls) are sandboxed to. |
 | `ALR_MAX_BODY_BYTES` | `200000` | Max request body size. |

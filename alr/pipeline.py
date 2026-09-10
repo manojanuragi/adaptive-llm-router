@@ -203,7 +203,7 @@ class Pipeline:
             prompt, ctx_before, ctx_after = self._build_frontier_prompt(envelope)
             try:
                 resp = call_frontier_llm(spec, prompt)
-                cost = estimate_cost(spec, resp.input_tokens, resp.output_tokens)
+                cost = resp.cost_usd if resp.cost_usd is not None else estimate_cost(spec, resp.input_tokens, resp.output_tokens)
                 return ExecutionResult(
                     trace_id=envelope.trace_id, route=decision.route, model=decision.model,
                     output=resp.text, confidence=decision.confidence, success=True, cost=cost,
@@ -304,7 +304,7 @@ class Pipeline:
             prompt, ctx_before, ctx_after = self._build_frontier_prompt(envelope)
             try:
                 resp = await call_frontier_llm_async(spec, prompt)
-                cost = estimate_cost(spec, resp.input_tokens, resp.output_tokens)
+                cost = resp.cost_usd if resp.cost_usd is not None else estimate_cost(spec, resp.input_tokens, resp.output_tokens)
                 return ExecutionResult(
                     trace_id=envelope.trace_id, route=decision.route, model=decision.model,
                     output=resp.text, confidence=decision.confidence, success=True, cost=cost,

@@ -5,7 +5,7 @@ models:
   local-coder:
     provider: local
     endpoint: http://localhost:11434   # Ollama default
-    model_name: qwen2.5-coder:32b      # change to whatever you have pulled
+    model_name: llama3.2:3b             # 8GB-RAM-friendly local test model (was qwen2.5-coder:32b)
     capabilities: [coding, summarization, extraction, log_analysis, classification]
     cost_per_1k_tokens: 0.0            # "free" but see effective-cost note in README
     latency_ms_p50: 800
