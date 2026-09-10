@@ -1,0 +1,97 @@
+# The ALR API tier. Deliberately stateless — every piece of state that
+# would break horizontal scaling has been externalized:
+#   - trace store   -> Postgres (DATABASE_URL, see postgres.yaml)
+#   - rate limiter   -> Redis (REDIS_URL, see redis.yaml)
+# so this Deployment can be scaled to N replicas (manually or via hpa.yaml)
+# without the correctness gaps the README used to document (in-memory
+# rate limiting, single-file SQLite) — those only apply if you unset
+# DATABASE_URL/REDIS_URL and fall back to single-replica local dev mode.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alr
+  labels:
+    app: alr
+spec:
+  replicas: 2  # baseline — hpa.yaml adjusts this within [minReplicas, maxReplicas]
+  selector:
+    matchLabels:
+      app: alr
+  template:
+    metadata:
+      labels:
+        app: alr
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: alr
+          image: adaptive-llm-router-alr:latest  # replace with your registry/tag before applying
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: alr-secrets
+          env:
+            - name: ALR_WORKSPACE_ROOT
+              value: /workspace
+          volumeMounts:
+            - name: models-config
+              mountPath: /app/alr/config/models.yaml
+              subPath: models.yaml
+              readOnly: true
+          resources:
+            # Required for the HPA's CPU-utilization target to mean
+            # anything — without a request, "70% of request" is undefined.
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+      volumes:
+        - name: models-config
+          configMap:
+            name: alr-models-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alr
+  labels:
+    app: alr
+spec:
+  selector:
+    app: alr
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+# Keeps at least half of desired replicas up during a node drain/rollout,
+# so a scale-down or cluster maintenance event can't take the whole API
+# tier down at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: alr-pdb
+spec:
+  minAvailable: 50%
+  selector:
+    matchLabels:
+      app: alr

@@ -1,0 +1,59 @@
+# Model registry — the router queries this instead of hard-coding model names.
+# Add/remove entries to change what the router can select without touching code.
+
+models:
+  local-coder:
+    provider: local
+    endpoint: http://localhost:11434   # Ollama default
+    model_name: qwen2.5-coder:32b      # change to whatever you have pulled
+    capabilities: [coding, summarization, extraction, log_analysis, classification]
+    cost_per_1k_tokens: 0.0            # "free" but see effective-cost note in README
+    latency_ms_p50: 800
+    privacy: high                       # never leaves the machine
+
+  claude:
+    provider: anthropic
+    model_name: claude-sonnet-5
+    capabilities: [coding, architecture, reasoning, debugging, security_review]
+    cost_per_1k_tokens: 0.006           # placeholder — set to your real rate card
+    latency_ms_p50: 2500
+    privacy: cloud
+
+# Rough capability matrix used by the rule-based router (section 15).
+# Keys MUST match the category names TaskAnalyzer produces (see
+# CATEGORY_KEYWORDS in analyzer.py) — that's how the router looks up
+# "expected quality" for a given model+category pair.
+# Values are 0..1 priors — replace with measured numbers once you have
+# real outcome data (see tracing.py / TraceStore.summary_metrics()).
+capability_matrix:
+  local-coder:
+    architecture: 0.50
+    security_review: 0.55
+    code_debugging: 0.65
+    code_generation: 0.75
+    planning: 0.60
+    log_analysis: 0.90
+    summarization: 0.92
+    classification: 0.90
+    documentation: 0.88
+    retrieval: 0.93
+    data_extraction: 0.96
+    general_reasoning: 0.70
+  claude:
+    architecture: 0.96
+    security_review: 0.95
+    code_debugging: 0.95
+    code_generation: 0.96
+    planning: 0.95
+    log_analysis: 0.96
+    summarization: 0.97
+    classification: 0.95
+    documentation: 0.94
+    retrieval: 0.96
+    data_extraction: 0.98
+    general_reasoning: 0.94
+
+# Confidence threshold below which Tier 1 output gets escalated to Tier 2.
+escalation:
+  confidence_threshold: 0.70
+  complexity_frontier_threshold: 0.80   # complexity above this skips local entirely

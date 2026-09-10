@@ -1,0 +1,21 @@
+# Core engine (alr/analyzer.py, router.py, validator.py, context.py,
+# tools.py, tracing.py, pipeline.py, local_llm.py, frontier_llm.py) needs
+# only this:
+PyYAML>=6.0
+
+# Everything below is only needed for the HTTP API layer (alr/api.py).
+# The engine works as a plain Python library without them — see demo.py.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.5
+
+# Required for horizontal autoscaling — a shared Postgres trace store
+# (DATABASE_URL) and shared Redis rate limiter (REDIS_URL) are what let
+# more than one replica share state correctly; see README "Autoscaling".
+# Both fall back gracefully to SQLite/in-memory if their env var isn't
+# set, so installing these has no effect on single-replica local dev.
+psycopg[binary]>=3.1
+redis>=5.0
+
+# Optional: dev/test tooling (stdlib unittest works fine without these)
+pytest>=8.0

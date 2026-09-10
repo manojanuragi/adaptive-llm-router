@@ -1,0 +1,63 @@
+# Model registry as a ConfigMap so it can be edited (add/remove models,
+# retune capability-matrix priors and the escalation threshold) without
+# rebuilding the container image — kubectl apply -f configmap.yaml && kubectl
+# rollout restart deployment/alr. Keep this in sync with alr/config/models.yaml
+# in the repo; deployment.yaml mounts it over the baked-in file at the same
+# path.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alr-models-config
+  labels:
+    app: alr
+data:
+  models.yaml: |
+    models:
+      local-coder:
+        provider: local
+        endpoint: http://ollama:11434
+        model_name: qwen2.5-coder:32b
+        capabilities: [coding, summarization, extraction, log_analysis, classification]
+        cost_per_1k_tokens: 0.0
+        latency_ms_p50: 800
+        privacy: high
+
+      claude:
+        provider: anthropic
+        model_name: claude-sonnet-5
+        capabilities: [coding, architecture, reasoning, debugging, security_review]
+        cost_per_1k_tokens: 0.006
+        latency_ms_p50: 2500
+        privacy: cloud
+
+    capability_matrix:
+      local-coder:
+        architecture: 0.50
+        security_review: 0.55
+        code_debugging: 0.65
+        code_generation: 0.75
+        planning: 0.60
+        log_analysis: 0.90
+        summarization: 0.92
+        classification: 0.90
+        documentation: 0.88
+        retrieval: 0.93
+        data_extraction: 0.96
+        general_reasoning: 0.70
+      claude:
+        architecture: 0.96
+        security_review: 0.95
+        code_debugging: 0.95
+        code_generation: 0.96
+        planning: 0.95
+        log_analysis: 0.96
+        summarization: 0.97
+        classification: 0.95
+        documentation: 0.94
+        retrieval: 0.96
+        data_extraction: 0.98
+        general_reasoning: 0.94
+
+    escalation:
+      confidence_threshold: 0.70
+      complexity_frontier_threshold: 0.80

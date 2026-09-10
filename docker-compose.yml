@@ -1,0 +1,81 @@
+# Default `docker compose up` — single replica, all state externalized
+# to Postgres + Redis so it's already scale-ready. To actually run
+# multiple replicas behind the load balancer:
+#
+#   docker compose up -d --build --scale alr=3
+#
+# `alr` has no published host port (see below) — `nginx` is what's
+# reachable on localhost:8000 and round-robins across however many `alr`
+# replicas are running. See the README's Autoscaling section for how to
+# verify requests are actually being distributed, and for the
+# Kubernetes-based HPA path (k8s/) once you're past docker-compose scale.
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - alr
+    restart: unless-stopped
+
+  alr:
+    build: .
+    # No "ports:" here on purpose — with --scale alr=N, a fixed host port
+    # mapping would collide across replicas. Traffic comes in through
+    # nginx above; for single-replica local debugging without nginx, run
+    # `docker compose run --rm -p 8000:8000 alr` instead.
+    environment:
+      - ALR_API_KEYS=${ALR_API_KEYS:-dev-key-change-me}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ALR_WORKSPACE_ROOT=/workspace
+      - DATABASE_URL=postgresql://alr:alr@postgres:5432/alr
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./:/workspace:ro   # mount your repo read-only so git/grep tools work
+    depends_on:
+      - ollama
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=alr
+      - POSTGRES_PASSWORD=alr
+      - POSTGRES_DB=alr
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alr"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  postgres_data:
+  redis_data:

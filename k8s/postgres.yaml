@@ -1,0 +1,76 @@
+# Single-instance Postgres for trying the whole stack in a cluster.
+# This is NOT production-HA (no replication/failover) — point DATABASE_URL
+# at a managed Postgres (RDS/Cloud SQL/etc.) for real deployments instead
+# of applying this file. It exists so `kubectl apply -f k8s/` gives you a
+# working end-to-end demo without external dependencies.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  labels:
+    app: alr-postgres
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: alr-postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # single PVC, can't do rolling update across two pods
+  selector:
+    matchLabels:
+      app: alr-postgres
+  template:
+    metadata:
+      labels:
+        app: alr-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: alr
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: alr-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: alr
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "alr"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata  # avoid postgres complaining about lost+found in the raw mount root
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: alr-postgres
+spec:
+  selector:
+    app: alr-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

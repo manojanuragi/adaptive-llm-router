@@ -1,0 +1,43 @@
+# Single-instance Redis backing the shared rate limiter (alr/rate_limit.py).
+# Not HA — point REDIS_URL at a managed Redis (ElastiCache/Memorystore/etc.)
+# for real deployments. Exists for the same reason as postgres.yaml: a
+# working end-to-end demo via `kubectl apply -f k8s/` alone.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: alr-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alr-redis
+  template:
+    metadata:
+      labels:
+        app: alr-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: alr-redis
+spec:
+  selector:
+    app: alr-redis
+  ports:
+    - port: 6379
+      targetPort: 6379

@@ -1,0 +1,56 @@
+# Horizontal Pod Autoscaler for the alr Deployment. Scales purely on CPU
+# by default since that's universally available; the commented block
+# below shows how to add a custom metric (e.g. requests-in-flight or
+# escalation_rate from GET /metrics/full) if you wire up the Prometheus
+# Adapter / KEDA — see the README's Autoscaling section.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: alr-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: alr
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # don't flap — wait 5min of sustained low load before scaling down
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0  # scale up immediately on load spikes
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+
+# --- Optional: scale on a custom app-level metric instead of/alongside CPU ---
+# Requires the Prometheus Adapter (or KEDA) exposing a custom metric such
+# as `alr_requests_in_flight` scraped from your own /metrics endpoint —
+# alr/api.py's GET /metrics/full is the source data (see README). Example:
+#
+#   metrics:
+#     - type: Pods
+#       pods:
+#         metric:
+#           name: alr_requests_in_flight
+#         target:
+#           type: AverageValue
+#           averageValue: "20"
