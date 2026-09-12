@@ -212,6 +212,7 @@ tests/
   test_savings.py                Pipeline._compute_savings — token/cost savings tracking
 demo.py               Zero-dependency routing-decisions-only demo
 pipeline_demo.py      Full pipeline demo with real execution
+alr_cli.py            Route your own ad-hoc tasks from the terminal — the actual day-to-day tool, not a fixed demo (see SETUP.md step 7)
 benchmarks/
   compare_direct_vs_router.py  Direct Claude vs. adaptive router — cost + accuracy (see "Benchmark" section)
   record_savings.py            Scheduled savings snapshot — run by benchmark.yml every 6h (see "Scheduled savings benchmark")

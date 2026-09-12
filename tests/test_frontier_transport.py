@@ -123,7 +123,8 @@ class TestCliTransportErrorReporting(unittest.TestCase):
     """
 
     @mock.patch("alr.frontier_llm.subprocess.run")
-    def test_invalid_oauth_token_error_is_extracted_from_stdout(self, mock_run):
+    @mock.patch("alr.frontier_llm.shutil.which", return_value="/usr/local/bin/claude")
+    def test_invalid_oauth_token_error_is_extracted_from_stdout(self, _mock_which, mock_run):
         stdout_payload = json.dumps({
             "is_error": True,
             "api_error_status": 401,
@@ -138,7 +139,8 @@ class TestCliTransportErrorReporting(unittest.TestCase):
         self.assertIn("401", str(ctx.exception))
 
     @mock.patch("alr.frontier_llm.subprocess.run")
-    def test_non_zero_exit_with_unparseable_stdout_falls_back_to_stderr(self, mock_run):
+    @mock.patch("alr.frontier_llm.shutil.which", return_value="/usr/local/bin/claude")
+    def test_non_zero_exit_with_unparseable_stdout_falls_back_to_stderr(self, _mock_which, mock_run):
         mock_run.return_value = subprocess.CompletedProcess(
             args=["claude"], returncode=1, stdout="", stderr="permission denied",
         )

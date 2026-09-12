@@ -95,7 +95,35 @@ This runs a few real tasks end-to-end (analyze → route → execute →
 validate → escalate → trace) using whatever you configured in step 4/5,
 and prints a rollup of cost, success rate, and (new) per-caller usage.
 
-## 7. Run the HTTP API
+## 7. Route your own tasks (the actual day-to-day tool)
+
+`demo.py` and `pipeline_demo.py` only illustrate the router with a fixed
+set of example tasks. To actually use ALR for your own real, ad-hoc work
+from the terminal, use `alr_cli.py` instead:
+
+```bash
+python3 alr_cli.py "git status"
+python3 alr_cli.py "Summarize this incident: connection pool exhausted under load"
+echo "some task text" | python3 alr_cli.py
+
+# Attach a file as evidence — compressed through the Context Firewall
+# before it ever reaches a frontier call:
+python3 alr_cli.py "Summarize the errors in this log" --context-file server.log
+
+# Flag risk/privacy like any other TaskEnvelope:
+python3 alr_cli.py "Investigate this incident" --risk high
+python3 alr_cli.py "Extract emails from this ticket" --privacy restricted
+```
+
+Each run prints the routing decision, the output, and that response's
+own cost/savings numbers, and records to the trace store just like a
+real `/execute` call would — so `GET /metrics` (or
+`pipeline.trace_store.summary_metrics()`) accumulates real usage across
+repeated runs of this script, not synthetic demo data. Point `DATABASE_URL`
+at your Neon instance (step 11) first if you want that history to persist
+in the cloud rather than a local SQLite file.
+
+## 8. Run the HTTP API
 
 ```bash
 pip install -r requirements.txt
@@ -113,7 +141,7 @@ credential from step 4 — that's intentional (see README "What changed to
 add per-caller usage tracking and startup auth enforcement"), not a bug.
 Fix step 4 if you see this.
 
-## 8. Use the API
+## 9. Use the API
 
 ```bash
 # Dry run — routing decision only, no execution
@@ -131,7 +159,7 @@ curl localhost:8000/metrics -H "x-api-key: $ALR_API_KEYS"        # cheap rollup
 curl localhost:8000/metrics/full -H "x-api-key: $ALR_API_KEYS"   # full evaluation metric set
 ```
 
-## 9. (Optional) Give each caller their own identity
+## 10. (Optional) Give each caller their own identity
 
 If more than one person/service will call your deployment, label each
 key instead of sharing one:
@@ -146,7 +174,7 @@ requests, cost, and cost saved per person. The label is never a secret
 (it's just shown in your own trace data) — the raw key itself is never
 logged or returned.
 
-## 10. (Optional) Move the trace store to the cloud
+## 11. (Optional) Move the trace store to the cloud
 
 By default every task/cost/savings/caller record lives in a local SQLite
 file (`alr_traces.db`). To make it persistent and visible from anywhere,
@@ -166,7 +194,7 @@ without any code change:
    # -> PostgresTraceStore  (not TraceStore, which means it's still SQLite)
    ```
 
-## 11. (Optional) Deploy with Docker
+## 12. (Optional) Deploy with Docker
 
 ```bash
 cp .env.example .env
@@ -182,7 +210,7 @@ curl localhost:8000/ready
 See README "Deploying it" and "Autoscaling" for multi-replica setup
 (Postgres + Redis shared across replicas) and Kubernetes manifests.
 
-## 12. (Optional) Enable the scheduled savings benchmark
+## 13. (Optional) Enable the scheduled savings benchmark
 
 Runs a tiny fixed task set every 6 hours and commits the cost/token
 savings numbers to `benchmarks/history/` in this repo.
