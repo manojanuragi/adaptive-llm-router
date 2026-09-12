@@ -123,6 +123,27 @@ repeated runs of this script, not synthetic demo data. Point `DATABASE_URL`
 at your Neon instance (step 11) first if you want that history to persist
 in the cloud rather than a local SQLite file.
 
+### Give it a short command name
+
+Typing `python3 alr_cli.py "..."` every time is friction you don't need.
+`bin/alr` is a thin wrapper around it — symlink it onto your `PATH` once
+and `alr "..."` works from any directory, the same way `claude "..."`
+does:
+
+```bash
+chmod +x bin/alr
+ln -sf "$(pwd)/bin/alr" ~/.local/bin/alr   # or any directory already on your PATH
+```
+
+```bash
+alr "git status"
+echo "some task" | alr
+```
+
+`bin/alr` resolves the real repo location even through the symlink, and
+prefers this repo's `.venv` if one exists (falling back to plain
+`python3` otherwise) — no need to activate the virtualenv first.
+
 ## 8. Run the HTTP API
 
 ```bash
@@ -228,6 +249,46 @@ savings numbers to `benchmarks/history/` in this repo.
 If the final `git push` step in that workflow fails with a permissions
 error, check Settings → Actions → General → **Workflow permissions** is
 set to "Read and write permissions."
+
+## 14. (Optional) Use ALR as a tool inside Claude
+
+**Important scope limit first:** this does *not* route an entire
+interactive Claude Code session through ALR — that's architecturally
+impossible (ALR's frontier tier is a single-turn, tool-free completion;
+an interactive session is the opposite of that, with multi-turn context
+and tool use). What this *does* do: expose ALR's routing pipeline as an
+MCP tool, so mid-conversation, Claude can delegate a specific,
+well-defined, self-contained sub-task (summarize this log, extract this
+data, answer one factual question) to ALR's tool/local/frontier tiering
+instead of always spending a turn on it directly — with real cost/savings
+numbers reported back for that one call.
+
+```bash
+pip install "mcp<2"   # already in requirements.txt
+```
+
+This repo already ships `alr_mcp_server.py` and a committed `.mcp.json`
+registering it at project scope. To use it:
+
+1. Open this project in Claude Code (`claude`, from this directory).
+2. The first time, you'll be prompted to approve the `alr` MCP server
+   (Claude Code never auto-trusts a project's `.mcp.json` — this is
+   intentional). Approve it.
+3. Two tools become available in that session: `route_task` (routes one
+   task through ALR, returns route/output/cost/savings) and
+   `get_alr_usage_summary` (the trace store's rollup so far).
+
+To verify it's wired correctly without needing a live Claude Code session
+(this is what confirms the server actually speaks MCP, not just that its
+underlying functions work):
+
+```bash
+python3 tests/manual_mcp_smoke_test.py
+```
+
+This spawns the server as a real subprocess and drives it over the
+actual MCP protocol — listing tools and calling both of them — rather
+than calling the Python functions directly.
 
 ---
 

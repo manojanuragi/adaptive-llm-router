@@ -65,9 +65,26 @@ class TestAuth(unittest.TestCase):
     def test_missing_key_rejected_when_keys_configured(self):
         self.assertFalse(verify_api_key(None, ["secret1"]))
 
-    def test_load_keys_from_env(self):
+    def test_load_keys_from_env_without_labels_never_uses_raw_key_as_identity(self):
+        # Regression test for a real vulnerability found via security
+        # review: unlabeled keys previously became their own identity,
+        # which /metrics' usage_by_caller then leaked to every other
+        # caller as a live, usable credential. Each unlabeled key must
+        # map to something that is NOT the key itself.
         with mock.patch.dict(os.environ, {"ALR_API_KEYS": "a, b ,c"}):
-            self.assertEqual(load_api_keys_from_env(), {"a": "a", "b": "b", "c": "c"})
+            resolved = load_api_keys_from_env()
+        self.assertEqual(set(resolved.keys()), {"a", "b", "c"})
+        for raw_key, identity in resolved.items():
+            self.assertNotEqual(identity, raw_key)
+            self.assertTrue(identity.startswith("unlabeled-"))
+        # Different keys must resolve to different identities.
+        self.assertEqual(len(set(resolved.values())), 3)
+
+    def test_load_keys_from_env_unlabeled_identity_is_stable_across_calls(self):
+        with mock.patch.dict(os.environ, {"ALR_API_KEYS": "a"}):
+            first = load_api_keys_from_env()
+            second = load_api_keys_from_env()
+        self.assertEqual(first, second)
 
     def test_load_keys_from_env_with_labeled_identities(self):
         with mock.patch.dict(os.environ, {"ALR_API_KEYS": "key1:alice, key2:bob"}):
@@ -76,6 +93,14 @@ class TestAuth(unittest.TestCase):
     def test_resolve_caller_id_returns_label_not_raw_key(self):
         keys = {"key1": "alice"}
         self.assertEqual(resolve_caller_id("key1", keys), "alice")
+
+    def test_resolve_caller_id_never_returns_a_raw_unlabeled_key(self):
+        # End-to-end regression: run an unlabeled key through the full
+        # load -> resolve path an attacker calling /metrics would see.
+        with mock.patch.dict(os.environ, {"ALR_API_KEYS": "super-secret-raw-key"}):
+            keys = load_api_keys_from_env()
+        caller_id = resolve_caller_id("super-secret-raw-key", keys)
+        self.assertNotEqual(caller_id, "super-secret-raw-key")
 
     def test_resolve_caller_id_falls_back_to_anonymous(self):
         self.assertEqual(resolve_caller_id("unknown", {"key1": "alice"}), "anonymous")

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "alr": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "alr_mcp_server.py"
+      ],
+      "env": {}
+    }
+  }
+}

@@ -12,6 +12,37 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
+
+    # Real Postgres + Redis so tests/test_scaling_infra.py's live
+    # autoscaling tests actually run instead of always skipping —
+    # previously this repo's CI never exercised those code paths at all,
+    # only whoever last ran them by hand against real Docker containers.
+    # Ports/credentials match test_scaling_infra.py's TEST_POSTGRES_DSN /
+    # TEST_REDIS_URL defaults, so no env vars need setting explicitly.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: alr
+          POSTGRES_PASSWORD: alr
+          POSTGRES_DB: alr
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -26,7 +57,7 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Syntax-check every module (including api.py's FastAPI import)
-        run: python -m py_compile alr/*.py demo.py pipeline_demo.py tests/*.py
+        run: python -m py_compile alr/*.py demo.py pipeline_demo.py alr_cli.py alr_mcp_server.py tests/*.py
 
   docker-build:
     runs-on: ubuntu-latest

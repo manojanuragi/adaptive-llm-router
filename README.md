@@ -7,6 +7,10 @@ with confidence-based escalation, a context firewall, trace logging, a
 full evaluation-metrics framework (sections 16–18), and horizontal
 autoscaling support.
 
+New to this repo? [SETUP.md](SETUP.md) is the step-by-step "do this,
+then this" path. [ARCHITECTURE.md](ARCHITECTURE.md) has the request-flow
+and module diagrams. This file is the full technical reference.
+
 ## What's actually implemented vs. stubbed
 
 | Component | Status |
@@ -213,6 +217,9 @@ tests/
 demo.py               Zero-dependency routing-decisions-only demo
 pipeline_demo.py      Full pipeline demo with real execution
 alr_cli.py            Route your own ad-hoc tasks from the terminal — the actual day-to-day tool, not a fixed demo (see SETUP.md step 7)
+bin/alr               Thin wrapper around alr_cli.py — symlink onto your PATH for a short `alr "..."` command, same pattern as `claude` (see SETUP.md step 7)
+alr_mcp_server.py     MCP server — exposes route_task/get_alr_usage_summary as tools an MCP client (Claude Code) can call mid-conversation (see SETUP.md step 14)
+.mcp.json             Project-scoped MCP server registration for alr_mcp_server.py (Claude Code prompts for approval before trusting it)
 benchmarks/
   compare_direct_vs_router.py  Direct Claude vs. adaptive router — cost + accuracy (see "Benchmark" section)
   record_savings.py            Scheduled savings snapshot — run by benchmark.yml every 6h (see "Scheduled savings benchmark")
@@ -432,22 +439,33 @@ separately in your own trace store.
 ALR_API_KEYS=sk-alice-xyz:alice,sk-bob-abc:bob,sk-team-ci:ci-pipeline
 ```
 
-A plain key with no `:label` still works exactly as before (its identity
-just defaults to the key itself) — this is fully backward compatible with
-existing `ALR_API_KEYS=key1,key2` configs. The label is never a secret —
-pick a name, a GitHub username, a team name — since it ends up in trace
-data and API responses; the raw key itself is never logged or returned.
+A plain key with no `:label` still works exactly as before for
+*authentication* — this is fully backward compatible with existing
+`ALR_API_KEYS=key1,key2` configs. Its *identity*, however, is a short
+hash of the key (`unlabeled-a1b2c3d4`), never the key itself — an
+earlier version of this feature used the raw key as the identity, which
+`GET /metrics`' `usage_by_caller` (below) would then hand back to any
+other caller with a valid key, leaking a live credential. Found via
+security review and fixed; see `alr/auth.py::load_api_keys_from_env`.
+The label is never a secret either way — pick a name, a GitHub username,
+a team name — since it ends up in trace data and API responses.
 
 **Where the identity shows up:**
 - `POST /execute` returns a `caller_id` field alongside the result.
 - `GET /metrics` and `GET /metrics/full` both add `usage_by_caller` — a
-  `{identity: {requests, cost, cost_saved}}` breakdown, e.g.:
+  `{identity: {requests, cost, cost_saved}}` breakdown for every caller
+  that's used this deployment, e.g.:
   ```json
   {"usage_by_caller": {"alice": {"requests": 12, "cost": 0.081, "cost_saved": 0.24}}}
   ```
+  This is intentionally a shared, unscoped dashboard for one team's own
+  deployment (see `alr/auth.py`'s own "single team's internal use" scope)
+  — not a boundary between mutually-distrusting tenants. Swap in real
+  auth (OAuth/JWT/mTLS) before using this for anything beyond that.
 - The trace store persists a `caller_id` column per row (SQLite and
   Postgres, migrated in place) — `"anonymous"` for unauthenticated
-  traffic or an unlabeled key, matching `alr/auth.py::resolve_caller_id`.
+  traffic, `unlabeled-<hash>` for an unlabeled key, or the configured
+  label — matching `alr/auth.py::resolve_caller_id`.
 
 This only tracks usage on infrastructure *you* control (your own trace
 store) — it has nothing to do with, and never touches, anyone's GitHub

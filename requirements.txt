@@ -19,3 +19,10 @@ redis>=5.0
 
 # Optional: dev/test tooling (stdlib unittest works fine without these)
 pytest>=8.0
+
+# Optional: only needed for alr_mcp_server.py — exposes ALR's routing
+# pipeline as an MCP tool Claude Code (or any MCP client) can call
+# mid-conversation. Pinned <2 because mcp 2.x renamed FastMCP to
+# MCPServer with a different API; see SETUP.md "Use ALR as a tool inside
+# Claude".
+mcp<2

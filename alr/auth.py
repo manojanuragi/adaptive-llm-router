@@ -11,6 +11,7 @@ for real auth (OAuth/JWT/mTLS) — see README deployment notes.
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import os
 from typing import Dict, Iterable, Optional
@@ -20,7 +21,18 @@ def load_api_keys_from_env(var_name: str = "ALR_API_KEYS") -> Dict[str, str]:
     """Comma-separated keys, each optionally labeled with a caller
     identity: `ALR_API_KEYS=key1:alice,key2:bob`. A plain key with no
     `:label` (`ALR_API_KEYS=key1,key2`, the original format) is still
-    accepted — its identity just defaults to the key itself.
+    accepted, but its identity is a short, non-reversible hash of the
+    key — never the key itself.
+
+    That distinction matters: the resolved identity is echoed in
+    `/execute` responses, persisted into the trace store, and returned in
+    full via `GET /metrics`'s `usage_by_caller` to any caller holding a
+    single valid key (see "Per-caller usage tracking" in the README —
+    that endpoint is intentionally a shared team dashboard, not scoped
+    per requester). Using the raw key as the identity would leak one
+    caller's live credential to every other caller through that
+    dashboard — a real vulnerability found via security review, not a
+    theoretical one.
 
     The label is a per-caller identity used only for usage tracking (see
     `ExecutionResult.caller_id` / `TraceStore` — it lets you see
@@ -40,7 +52,11 @@ def load_api_keys_from_env(var_name: str = "ALR_API_KEYS") -> Dict[str, str]:
             continue
         key, sep, identity = entry.partition(":")
         key = key.strip()
-        keys[key] = identity.strip() if sep and identity.strip() else key
+        if sep and identity.strip():
+            keys[key] = identity.strip()
+        else:
+            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+            keys[key] = f"unlabeled-{digest}"
     return keys
 
 
