@@ -16,11 +16,14 @@ autoscaling support.
 | Rule-based Router (Strategy A) | ✅ real, tested |
 | Tier 0 deterministic tools (git, grep, json/csv parse, tests) | ✅ real, tested, path-sandboxed |
 | Tier 1 local LLM connector (Ollama) | ✅ real code, sync + async, retry/circuit-breaker; needs Ollama running to execute |
-| Tier 2 frontier LLM connector (Claude) | ✅ real code, sync + async, retry/circuit-breaker; shells out to the `claude` CLI so it runs on your existing Claude Code login — no separate `ANTHROPIC_API_KEY` needed (see "Using your existing Claude CLI login" below) |
+| Tier 2 frontier LLM connector (Claude) | ✅ real code, sync + async, retry/circuit-breaker; **two selectable transports** — shell out to the `claude` CLI, billed against your Claude Pro/Max subscription (interactive `claude login`, or headless via `CLAUDE_CODE_OAUTH_TOKEN`), or call the raw Anthropic Messages API directly (optional, `ANTHROPIC_API_KEY`) — see "Two ways to run Tier 2" below |
+| Token/cost savings tracking (per response + rolled up) | ✅ real, tested — `Pipeline._compute_savings()`; see "Token & cost savings tracking" below |
+| Scheduled savings benchmark, committed to git every 6h | ✅ real — `.github/workflows/benchmark.yml` + `benchmarks/record_savings.py`; see "Scheduled savings benchmark" below |
 | Confidence/escalation logic | ✅ real, tested (heuristic signals — see "Honest limitations") |
 | Context firewall (compression + progressive disclosure) | ✅ real, tested, wired into frontier calls when `payload["context_text"]` is set |
 | Policy engine (section 21) | ✅ real, tested — deny/require-approval on high-risk patterns, enforced inside the pipeline |
-| Auth (API keys) | ✅ real, tested |
+| Auth (API keys) | ✅ real, tested — supports optional `key:identity` labels for per-caller usage tracking (see "Per-caller usage tracking" below) |
+| Frontier auth startup enforcement | ✅ real, tested — `validate_frontier_auth()` refuses to start the API if no usable Claude credential is configured, instead of failing confusingly on the first request |
 | Rate limiting | ✅ real, tested — **Redis-backed and verified across independently running containers** when `REDIS_URL` is set; falls back to in-memory (single-process) otherwise |
 | Retry + circuit breaker | ✅ real, tested |
 | Trace store + rollup metrics | ✅ real, tested — **Postgres backend verified against a live `postgres:16-alpine` instance**, including a concurrent-startup race that was found and fixed (see Autoscaling section); SQLite remains the single-replica default |
@@ -31,16 +34,25 @@ autoscaling support.
 | Model competition, router memory, dynamic model marketplace | ❌ not built — "Advanced Features" in the doc, intentionally deferred |
 | Approval-workflow UI (Slack/queue/human-in-the-loop) | ❌ not built — `PolicyEngine.approval_callback` is a hook for you to wire up |
 
-76 tests pass. The core 67 use only the Python standard library +
-PyYAML (no network, no API keys, no local model server, no Docker
-required). 9 more exercise the Redis/Postgres-backed autoscaling path
-against real containers and auto-skip if those aren't reachable (see
-"Testing the autoscaling path" below). Run them yourself:
-`python3 -m unittest discover -s tests -v`.
+99 tests pass. 90 of them use only the Python standard library + PyYAML
+(no network, no API keys, no local model server, no Docker required) —
+that count includes `test_frontier_transport.py` (CLI/API dispatch,
+frontier-auth startup validation, with `urllib`/`subprocess` mocked) and
+`test_savings.py` (token/cost savings tracking). 9 more exercise the
+Redis/Postgres-backed autoscaling path against real containers and
+auto-skip if those aren't reachable (see "Testing the autoscaling path"
+below). Run them yourself: `python3 -m unittest discover -s tests -v`.
 
 ## Quick start
 
+**Requirements:** Python 3.11 or 3.12 (matches the CI matrix — other 3.x
+versions likely work but aren't tested).
+
 ```bash
+# 0. Get the code
+git clone <this-repo-url>
+cd adaptive-llm-router
+
 # 1. Zero-dependency taste test — routing decisions only, no execution
 pip install pyyaml   # if you don't have it
 python3 demo.py
@@ -49,7 +61,7 @@ python3 demo.py
 python3 -m unittest discover -s tests -v
 
 # 3. Real execution (needs Ollama running and/or the `claude` CLI logged in —
-#    see "Using your existing Claude CLI login" below; no API key required)
+#    see "Two ways to run Tier 2" below; no API key required)
 python3 pipeline_demo.py
 
 # 4. HTTP API
@@ -75,38 +87,58 @@ Without Ollama running, Tier-1 calls fail closed (`LocalLLMUnavailable`)
 and the pipeline returns `success=False` with the error message rather
 than crashing — check `result.output` in that case.
 
-## Using your existing Claude CLI login (no API key required)
+## Two ways to run Tier 2: Claude CLI (your subscription) vs. the raw Anthropic API
 
-`alr/frontier_llm.py` doesn't call the Anthropic Messages API directly —
-it shells out to the `claude` CLI (Claude Code) in non-interactive print
-mode:
+`alr/frontier_llm.py` supports two transports for calling the frontier
+model, selected with the `ALR_FRONTIER_TRANSPORT` env var (or pinned per
+model via `transport:` in `models.yaml`) — same public functions
+(`call_frontier_llm`, `call_frontier_llm_async`, `FrontierLLMResponse`)
+either way, so nothing else in the pipeline changes. **`ANTHROPIC_API_KEY`
+is entirely optional** — both the interactive and headless variants of
+the default `cli` transport bill against your existing Claude Pro/Max
+subscription instead of raw API usage:
+
+| Transport | `ALR_FRONTIER_TRANSPORT` | Auth | Billing | Best for |
+|---|---|---|---|---|
+| **CLI, interactive** (default) | `cli` or unset | `claude login` session | Your Claude Pro/Max subscription | Running the router directly on your own machine |
+| **CLI, headless** (default) | `cli` or unset | `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) | Your Claude Pro/Max subscription | Docker/Kubernetes/CI without an interactive login, while still using your subscription, not API billing |
+| **Raw API** (optional) | `api` | `ANTHROPIC_API_KEY` | Raw Anthropic API usage | Anyone who'd rather bill through the API instead of a subscription |
+
+### CLI transport (default) — subscription billing, interactive or headless
+
+Shells out to the `claude` CLI (Claude Code) in non-interactive print mode:
 
 ```
 claude -p "<task text>" --output-format json --model claude-sonnet-5 --restricted
 ```
 
-This means Tier-2 (frontier) execution reuses whatever Claude Code login
-you already have (`claude login`) instead of requiring a separate
-`ANTHROPIC_API_KEY` and raw API billing. `--restricted` disables Claude
-Code's own Bash/file tools so each call is a plain single-turn
-completion, not an agent run. The CLI's JSON output reports
-`total_cost_usd` directly, which `pipeline.py` uses as the authoritative
-cost for that call (falling back to the registry's blended
-`cost_per_1k_tokens` estimate only if that field is ever missing).
+`--restricted` disables Claude Code's own Bash/file tools so each call is
+a plain single-turn completion, not an agent run. The CLI's JSON output
+reports `total_cost_usd` directly, which `pipeline.py` uses as the
+authoritative cost for that call (falling back to the registry's blended
+`cost_per_1k_tokens` estimate only if that field is ever missing). This
+transport never touches `ANTHROPIC_API_KEY` — the `claude` CLI
+authenticates itself, and `frontier_llm.py` just inherits whatever
+environment the CLI is already using.
 
-**Requirements:** the `claude` binary on `PATH` and an active `claude
-login` session on the machine running the router. No `.env` entry, no
-`ANTHROPIC_API_KEY` needed for this path.
+**Two ways to authenticate this transport, same code path either way:**
+- **Interactive** — run `claude login` once on the machine running the
+  router. Nothing else to configure.
+- **Headless** (Docker, Kubernetes, CI/scheduled jobs — no interactive
+  session available) — run `claude setup-token` once *interactively,
+  anywhere* to mint a long-lived OAuth token, then set it as
+  `CLAUDE_CODE_OAUTH_TOKEN` in the headless environment (e.g. a GitHub
+  Actions secret). The `claude` binary picks this env var up on its own;
+  `subprocess.run()` in `frontier_llm.py` inherits the parent process's
+  environment by default, so no code change is needed to use it. This is
+  what `.github/workflows/benchmark.yml` uses by default — see
+  "Scheduled savings benchmark" below. **Either way, this bills against
+  your Claude Pro/Max subscription, not per-token API usage.**
+
+**Requirements:** the `claude` binary on `PATH`, plus one of the two auth
+methods above.
 
 **Trade-offs to know before you rely on this:**
-- **Doesn't work in a container out of the box.** The Docker/Kubernetes
-  deployment paths below assume a headless environment with no
-  interactive login, so they still need the original
-  `ANTHROPIC_API_KEY`-based Messages-API connector. Swap
-  `alr/frontier_llm.py` back to a raw-HTTP implementation for those
-  paths — the function signatures (`call_frontier_llm`,
-  `call_frontier_llm_async`, `FrontierLLMResponse`) are unchanged, so
-  nothing else in the pipeline needs to change.
 - **Cost includes Claude Code's own overhead.** Each call carries Claude
   Code's system prompt/tool-definition prefix (even in `--restricted`
   mode), which is billed like any other input tokens the first time and
@@ -116,6 +148,35 @@ login` session on the machine running the router. No `.env` entry, no
 - **Adds subprocess latency.** Spinning up the CLI per call is slower
   than a raw HTTPS request — fine for a router doing a handful of
   escalations, not ideal for high-throughput frontier traffic.
+- **Subscription usage still has limits** (Pro/Max plan quotas) — high
+  request volume can hit those before it would hit a pay-as-you-go API
+  budget. Switch to the API transport below if you need metered,
+  uncapped-by-plan billing instead.
+
+### API transport (optional) — raw Anthropic API usage
+
+Set `ALR_FRONTIER_TRANSPORT=api` and `ANTHROPIC_API_KEY`, and
+`frontier_llm.py` calls `https://api.anthropic.com/v1/messages` directly
+over `urllib` (stdlib only, no `anthropic` SDK dependency, consistent
+with `local_llm.py`'s Ollama connector). This is entirely optional — the
+headless CLI transport above (subscription billing) covers the same
+headless/CI use case without needing an API key at all. Reach for this
+only if you specifically want raw API billing instead.
+
+```bash
+export ALR_FRONTIER_TRANSPORT=api
+export ANTHROPIC_API_KEY=sk-ant-...
+python3 pipeline_demo.py   # or uvicorn alr.api:app, etc.
+```
+
+The Messages API doesn't return a billed-dollars figure the way the
+Claude CLI's JSON output does, so cost always falls back to the
+registry's `cost_per_1k_tokens` estimate for this transport (`cost_usd`
+is always `None` from `_call_frontier_llm_api`).
+
+You can also pin the transport per model regardless of the env var by
+adding `transport: api` (or `cli`) under that model's entry in
+`alr/config/models.yaml`.
 
 ## Project layout
 
@@ -128,7 +189,7 @@ alr/
   analyzer.py     Task Analyzer — keyword/heuristic classification (section 8)
   tools.py        Tier 0 — deterministic tools: git, grep, test runner, parsers (path-sandboxed)
   local_llm.py    Tier 1 — Ollama connector, sync + async (stdlib urllib, no SDK dependency)
-  frontier_llm.py Tier 2 — Claude CLI connector (subprocess), sync + async; see "Using your existing Claude CLI login"
+  frontier_llm.py Tier 2 — dual transport: Claude CLI (subprocess) or raw Anthropic API (urllib), sync + async; see "Two ways to run Tier 2"
   router.py       Rule-based Adaptive Routing Engine (Strategy A, section 9)
   validator.py    Confidence scoring + escalation decision (section 10)
   context.py      Context firewall + progressive disclosure (sections 12, 23)
@@ -147,15 +208,20 @@ tests/
   test_deployment_readiness.py  Policy engine, auth, rate limiter, retry/breaker, path safety, async pipeline
   test_evaluation.py            Evaluation metrics, pass@k, baseline comparison harness
   test_scaling_infra.py         Registry/token-count regressions + live Redis/Postgres autoscaling tests (auto-skip if unreachable)
+  test_frontier_transport.py    CLI/API transport dispatch + raw Anthropic API connector (mocked urllib)
+  test_savings.py                Pipeline._compute_savings — token/cost savings tracking
 demo.py               Zero-dependency routing-decisions-only demo
 pipeline_demo.py      Full pipeline demo with real execution
 benchmarks/
   compare_direct_vs_router.py  Direct Claude vs. adaptive router — cost + accuracy (see "Benchmark" section)
+  record_savings.py            Scheduled savings snapshot — run by benchmark.yml every 6h (see "Scheduled savings benchmark")
+  history/                      Committed savings track record: savings_history.jsonl (raw) + SUMMARY.md (table)
 Dockerfile            Non-root, healthcheck, workspace-sandboxed
 docker-compose.yml    App (N replicas) + nginx load balancer + Postgres + Redis + Ollama — scale-ready by default
 nginx.conf            Round-robin load balancer config for docker-compose --scale
 k8s/                  Kubernetes manifests: Deployment, Service, HPA, ConfigMap, PDB, demo Postgres/Redis
-.github/workflows/ci.yml  Test suite + Docker build on every push
+.github/workflows/ci.yml         Test suite + Docker build on every push
+.github/workflows/benchmark.yml  Scheduled savings benchmark, every 6h — see "Scheduled savings benchmark"
 ```
 
 Each module only depends on the ones below it in this list (tools/connectors
@@ -308,6 +374,148 @@ matched it at the same cost (correctly escalating) or matched it for
 free (correctly staying local). That is the actual value proposition:
 never worse, sometimes free — not a guaranteed discount.
 
+## Token & cost savings tracking
+
+Every response the pipeline produces gets a savings figure attached —
+not just an aggregate benchmark number, but per-response, in real time.
+`Pipeline._compute_savings()` (`alr/pipeline.py`) runs on every `run()`/
+`run_async()` result right before it's traced, and populates five new
+`ExecutionResult` fields:
+
+| Field | Meaning |
+|---|---|
+| `baseline_cost` | What the registry's frontier model would have cost for this same response |
+| `cost_saved` | `baseline_cost - cost` |
+| `cost_saved_pct` | `cost_saved` as a percentage of `baseline_cost` |
+| `tokens_saved` | Tokens not billed against the frontier model for this response |
+| `tokens_saved_pct` | `tokens_saved` as a percentage of the relevant token baseline |
+
+**Definitions (a proxy, not measured ground truth — same honesty caveat
+as the rest of this MVP's economics, see Honest limitations below):**
+- **Tool/local responses** (not escalated) never reached the frontier
+  model at all, so the *entire* frontier-equivalent cost for the same
+  token volume — estimated via the registry's frontier
+  `cost_per_1k_tokens` rate — counts as saved. A tool-tier response with
+  no tokens (e.g. `git status`) reports 0% since there's no token volume
+  to compare against.
+- **Frontier responses** (direct or escalated) already paid frontier
+  cost — the only savings available there come from the Context Firewall
+  (sections 12/23) shrinking the prompt before it was sent. Savings are
+  computed from `context_tokens_before`/`context_tokens_after` when
+  present, and zero otherwise.
+
+**Where to see it:**
+- `POST /execute` returns `baseline_cost`, `cost_saved`, `cost_saved_pct`,
+  `tokens_saved`, `tokens_saved_pct` alongside the existing `cost` field.
+- `GET /metrics` (the cheap rollup) adds `total_baseline_cost`,
+  `total_cost_saved`, `cost_saved_pct`, `total_tokens_saved`.
+- `GET /metrics/full` adds the same four fields computed across the full
+  trace history via `alr/evaluation.py::compute_evaluation_metrics`.
+- The trace store (SQLite and Postgres) persists all five per-response
+  fields in new `baseline_cost`/`cost_saved`/`cost_saved_pct`/
+  `tokens_saved`/`tokens_saved_pct` columns, migrated in place via
+  `ALTER TABLE ... ADD COLUMN` so existing trace databases don't need to
+  be recreated.
+
+## Per-caller usage tracking
+
+If you're running one deployment that multiple people/services call
+(a shared team API), each caller can get their own named API key instead
+of everyone sharing one anonymous secret — and their usage gets tracked
+separately in your own trace store.
+
+**Set up labeled keys** — `ALR_API_KEYS` accepts an optional
+`key:identity` label per entry, comma-separated:
+
+```bash
+ALR_API_KEYS=sk-alice-xyz:alice,sk-bob-abc:bob,sk-team-ci:ci-pipeline
+```
+
+A plain key with no `:label` still works exactly as before (its identity
+just defaults to the key itself) — this is fully backward compatible with
+existing `ALR_API_KEYS=key1,key2` configs. The label is never a secret —
+pick a name, a GitHub username, a team name — since it ends up in trace
+data and API responses; the raw key itself is never logged or returned.
+
+**Where the identity shows up:**
+- `POST /execute` returns a `caller_id` field alongside the result.
+- `GET /metrics` and `GET /metrics/full` both add `usage_by_caller` — a
+  `{identity: {requests, cost, cost_saved}}` breakdown, e.g.:
+  ```json
+  {"usage_by_caller": {"alice": {"requests": 12, "cost": 0.081, "cost_saved": 0.24}}}
+  ```
+- The trace store persists a `caller_id` column per row (SQLite and
+  Postgres, migrated in place) — `"anonymous"` for unauthenticated
+  traffic or an unlabeled key, matching `alr/auth.py::resolve_caller_id`.
+
+This only tracks usage on infrastructure *you* control (your own trace
+store) — it has nothing to do with, and never touches, anyone's GitHub
+account. If you want callers to authenticate with something like a real
+GitHub identity rather than a static labeled key, swap `alr/auth.py` for
+a real OAuth/JWT verifier that resolves `caller_id` from the token —
+`resolve_caller_id()` is the one function everything downstream depends
+on, so nothing else needs to change.
+
+## Scheduled savings benchmark
+
+`.github/workflows/benchmark.yml` runs every 6 hours (`cron: "0 */6 * *
+*"`, plus a manual `workflow_dispatch` trigger) and:
+
+1. Picks an auth method — `CLAUDE_CODE_OAUTH_TOKEN` (headless CLI,
+   billed against your Claude Pro/Max subscription) if set, else
+   `ANTHROPIC_API_KEY` (raw API billing) if that's set instead, else
+   fails with a clear error naming both options.
+2. Runs `benchmarks/record_savings.py` — a small, fixed task set (one
+   free Tier-0 tool task, one task engineered to route straight to the
+   frontier tier) through the real `Pipeline`.
+3. Appends the run's per-task and aggregate savings numbers as one JSON
+   line to `benchmarks/history/savings_history.jsonl`, and one row to the
+   human-readable `benchmarks/history/SUMMARY.md` table.
+4. Commits both files back to the repo (`[skip ci]` so it doesn't
+   re-trigger the main test workflow) — so the savings track record is
+   visible directly in git history, not just in a dashboard that resets.
+
+**Setup required (pick one):**
+- **Recommended — use your existing Claude Pro/Max subscription, no API
+  key:** run `claude setup-token` once on any machine with the CLI
+  installed and logged in. It prints a long-lived token — add it as the
+  `CLAUDE_CODE_OAUTH_TOKEN` repository secret (Settings → Secrets and
+  variables → Actions). The workflow installs the CLI itself
+  (`npm install -g @anthropic-ai/claude-code`) and this token
+  authenticates it headlessly, billed the same as your normal Claude Code
+  usage.
+- **Optional alternative — raw API billing:** add an `ANTHROPIC_API_KEY`
+  repository secret instead. Only needed if you specifically want
+  per-token API billing rather than subscription billing.
+
+Neither secret is required for the rest of the app to work — this is only
+for the scheduled workflow. It fails loudly with a clear error if neither
+is configured, rather than silently no-opping.
+
+**Before any of this works, the workflow file has to actually be on
+GitHub** — cloning/editing this repo locally doesn't register the
+workflow by itself. Commit `.github/workflows/benchmark.yml` (and
+whatever else you've changed) and push to your default branch, or it
+won't show up under the repo's **Actions** tab and setting the secret
+beforehand accomplishes nothing yet.
+
+**If the workflow runs but fails on the final `git push` step:** check
+Settings → Actions → General → **Workflow permissions** on the repo. If
+it's set to "Read repository contents" (read-only), the `permissions:
+contents: write` declared in `benchmark.yml` usually overrides that for
+its own run, but some org-level policies enforce read-only regardless —
+switch it to "Read and write permissions" if the push step fails with a
+403.
+
+**Cost note:** this calls Claude 4 times a day, forever, for as long as
+the workflow is enabled — against your subscription's usage limits if
+using `CLAUDE_CODE_OAUTH_TOKEN`, or as metered spend if using
+`ANTHROPIC_API_KEY`. The default task set is deliberately tiny and cheap
+(one free tool call + one short architecture prompt) — if you expand
+`TASKS` in `benchmarks/record_savings.py`, that cost scales with it.
+Disable the workflow (or widen the cron interval) if you don't want the
+recurring usage.
+
 ## Honest limitations (read before you pitch this to anyone)
 
 - **The confidence signal is heuristic, not calibrated.** It blends a
@@ -381,10 +589,13 @@ never worse, sometimes free — not a guaranteed discount.
 | No CI | `.github/workflows/ci.yml` — runs the full test suite + a Docker build on every push |
 | No graceful startup/shutdown | FastAPI `lifespan` context in `api.py` |
 
-76 tests total (48 from the original core/pipeline/deployment-readiness
-suites + 19 in `tests/test_evaluation.py` + 9 in
-`tests/test_scaling_infra.py`), all passing on stdlib + PyYAML — run them
-yourself: `python3 -m unittest discover -s tests -v`.
+99 tests total (51 from the core/pipeline/deployment-readiness suites
+(includes the per-caller auth identity tests) + 19 in
+`tests/test_evaluation.py` + 9 in `tests/test_scaling_infra.py` + 15 in
+`tests/test_frontier_transport.py` (CLI/API dispatch, the CLI
+stdout-error-reporting regression, and frontier-auth startup validation)
++ 5 in `tests/test_savings.py`), all passing on stdlib + PyYAML — run
+them yourself: `python3 -m unittest discover -s tests -v`.
 
 ## What changed to make it autoscalable and add the full evaluation framework
 
@@ -405,19 +616,50 @@ race and its fix — were verified against real Docker containers during
 development, not just written and assumed correct. See the Autoscaling
 section for exactly what was tested and how to reproduce it.
 
+## What changed to add dual transports and savings tracking
+
+| Gap | What was added |
+|---|---|
+| Frontier connector only worked with an interactive `claude login` session, no headless option | `CLAUDE_CODE_OAUTH_TOKEN` support for the existing CLI transport (headless, still billed against your Claude Pro/Max subscription — no code change needed, `subprocess.run()` already inherits the environment) plus a fully optional `alr/frontier_llm.py::_call_frontier_llm_api` — raw Anthropic Messages API over stdlib `urllib`, selected via `ALR_FRONTIER_TRANSPORT=api` — see "Two ways to run Tier 2" |
+| No per-response savings figure — only aggregate benchmark comparisons | `Pipeline._compute_savings()` populates `baseline_cost`/`cost_saved`/`cost_saved_pct`/`tokens_saved`/`tokens_saved_pct` on every `ExecutionResult`, surfaced in `/execute`, `/metrics`, `/metrics/full`, and persisted in the trace store (`_V3_COLUMNS` in `alr/tracing.py`, migrated in place) — see "Token & cost savings tracking" |
+| No automated record of savings over time | `.github/workflows/benchmark.yml` — 6-hour cron running `benchmarks/record_savings.py` against the API transport, committing results to `benchmarks/history/` — see "Scheduled savings benchmark" |
+
+## What changed to add per-caller usage tracking and startup auth enforcement
+
+| Gap | What was added |
+|---|---|
+| `ALR_API_KEYS` validated a caller but never identified *which* caller — usage wasn't attributable per key at all | `alr/auth.py::load_api_keys_from_env` now accepts optional `key:identity` labels; `resolve_caller_id()` returns the label (never the raw secret key) to `/execute`/`/route`; threaded through `TaskEnvelope.caller_id` → `Pipeline` → `TraceStore` (new `caller_id` column, `_V4_COLUMNS`, migrated in place) → `usage_by_caller` in `GET /metrics` and `/metrics/full` — see "Per-caller usage tracking" |
+| A missing/invalid frontier credential only surfaced as a confusing per-request failure (exactly what happened during development — see the CLI stdout-parsing bug fixed in `_call_frontier_llm_cli`) | `alr/frontier_llm.py::validate_frontier_auth()` runs at API startup and refuses to serve traffic if a cloud-capable model is registered but no usable credential is configured for its transport — skips the check entirely for local/tool-only deployments with no cloud model registered |
+
 ## Deploying it
 
-> **Note:** the steps below build a container image, which has no
-> interactive `claude login` session — so this path needs
-> `alr/frontier_llm.py` swapped back to a raw Messages-API connector
-> using `ANTHROPIC_API_KEY` (see "Using your existing Claude CLI login"
-> above). Running the app directly on your own machine (Quick start)
-> uses the CLI-based connector and needs no API key at all.
+> **Note:** the steps below build a container image, and this Dockerfile
+> doesn't install the `claude` CLI — so the simplest path here is
+> `ALR_FRONTIER_TRANSPORT=api` with `ANTHROPIC_API_KEY` in `.env` (see
+> "Two ways to run Tier 2" above). If you'd rather keep billing against
+> your Claude Pro/Max subscription instead of the API, add Node.js + `npm
+> install -g @anthropic-ai/claude-code` to the Dockerfile and set
+> `CLAUDE_CODE_OAUTH_TOKEN` instead — that's exactly what
+> `.github/workflows/benchmark.yml` does for the scheduled benchmark, just
+> not wired into this Dockerfile by default. Running the app directly on
+> your own machine (Quick start) can leave `ALR_FRONTIER_TRANSPORT` unset
+> to use the CLI-based connector with your regular `claude login` session,
+> no API key at all.
+>
+> **The API will now refuse to start at all** if it has a cloud-capable
+> model registered (the default `models.yaml` always does) but no usable
+> Claude credential configured for the resolved transport —
+> `alr/frontier_llm.py::validate_frontier_auth()` runs at startup and
+> raises before the app accepts any traffic, rather than letting a
+> half-configured deployment fail confusingly on its first real request.
+> Each deployer needs their own credential; none ship with this repo.
 
 ```bash
 # 1. Configure
 cp .env.example .env
-# edit .env: set ALR_API_KEYS (required), ANTHROPIC_API_KEY (if using the raw-API connector)
+# edit .env: set ALR_API_KEYS (required), and for this container image
+# also set ALR_FRONTIER_TRANSPORT=api + ANTHROPIC_API_KEY (optional —
+# see the note above for the subscription-billed alternative)
 
 # 2. Build + run
 docker compose up --build
@@ -434,14 +676,57 @@ curl -X POST localhost:8000/execute \
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ALR_API_KEYS` | unset (auth OFF) | Comma-separated valid API keys. **Set this in any real deployment** — startup logs a warning if unset. |
-| `ANTHROPIC_API_KEY` | unset | Only used if `alr/frontier_llm.py` is swapped back to the raw Messages-API connector (e.g. for the Docker/k8s paths). The default CLI-based connector needs no API key — see "Using your existing Claude CLI login". |
-| `DATABASE_URL` | unset (uses SQLite) | Postgres DSN — switches `build_trace_store()` to `PostgresTraceStore` (see limitations above). |
+| `ALR_API_KEYS` | unset (auth OFF) | Comma-separated valid API keys, each optionally labeled `key:identity` (e.g. `key1:alice,key2:bob`) for per-caller usage tracking — see "Per-caller usage tracking". **Set this in any real deployment** — startup logs a warning if unset. |
+| `ALR_FRONTIER_TRANSPORT` | `cli` | `cli` (shells out to `claude`, billed against your subscription) or `api` (raw Anthropic Messages API, optional, billed as API usage) — see "Two ways to run Tier 2". Overridable per model via `transport:` in `models.yaml`. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | unset | Optional — headless auth for the default `cli` transport (from `claude setup-token`), billed against your Claude Pro/Max subscription. Not needed if you have an interactive `claude login` session instead. |
+| `ANTHROPIC_API_KEY` | unset | Optional — only used when `ALR_FRONTIER_TRANSPORT=api`. Not required for the default `cli` transport, interactive or headless. |
+| `DATABASE_URL` | unset (uses SQLite) | Postgres DSN — switches `build_trace_store()` to `PostgresTraceStore` (see limitations above). A free-tier Neon database works here with zero code changes — see "Cloud trace store (free tier)". |
 | `ALR_WORKSPACE_ROOT` | `.` | Root that Tier-0 filesystem tools (git/grep/ls) are sandboxed to. |
 | `ALR_MAX_BODY_BYTES` | `200000` | Max request body size. |
 | `ALR_RATE_LIMIT_CAPACITY` | `60` | Token bucket burst capacity per API key. |
 | `ALR_RATE_LIMIT_REFILL_PER_S` | `1.0` | Steady-state requests/sec per API key. |
 | `REDIS_URL` | unset (in-memory limiter) | Redis DSN — switches `build_rate_limiter()` to `RedisRateLimiter` so rate limits are shared across replicas. Falls back to in-memory (with a startup warning) if unset or unreachable. |
+
+## Cloud trace store (free tier)
+
+By default the trace store (every task, cost, savings figure, per-caller
+usage row) lives in a local SQLite file (`alr_traces.db`) — fine for a
+single machine, but it disappears if that disk does, and it isn't
+visible from anywhere else. `alr/tracing.py::build_trace_store()` already
+switches to `PostgresTraceStore` the moment `DATABASE_URL` is set, so
+pointing it at a cloud Postgres instance needs **no code change** — just
+the connection string.
+
+**[Neon](https://neon.com)** has a permanent free tier (not a time-limited
+trial) that fits this: 0.5GB storage, 100 compute-hours/month, no credit
+card required, and it scales to zero when idle (so a low-traffic personal
+deployment effectively costs nothing).
+
+**Setup:**
+1. Sign up at neon.com, create a project, and copy its connection string
+   (`postgresql://<user>:<password>@<host>/<dbname>?sslmode=require`).
+2. **Never paste that string into a chat or commit it to git** — it
+   contains a real password, the same sensitivity class as an API key.
+   Set it as an environment variable directly in your own terminal or
+   `.env` file instead:
+   ```bash
+   export DATABASE_URL="postgresql://...your-neon-connection-string..."
+   ```
+3. Run the app as usual (`uvicorn alr.api:app` or `python3
+   pipeline_demo.py`) — `psycopg[binary]` is already in
+   `requirements.txt`, so no extra install is needed. `PostgresTraceStore`
+   handles schema setup itself on first connect (including the
+   concurrent-startup-safe advisory lock described in Autoscaling below).
+4. Verify it's actually using Postgres, not silently falling back to
+   SQLite: hit `GET /ready` (fails loudly if the configured store is
+   unreachable) or check the trace data shows up in Neon's own SQL editor
+   after running a task.
+
+**Trade-off:** free-tier compute-hours and idle-scale-to-zero mean the
+*first* request after a period of inactivity pays a cold-start penalty
+(typically a few hundred ms to a couple of seconds) while Neon wakes the
+database back up — negligible for personal use, worth knowing about
+before you assume every request has the same latency.
 
 ## Autoscaling
 

@@ -25,6 +25,7 @@ class ModelSpec:
     latency_ms_p50: int
     privacy: str  # "high" (local-only) | "cloud"
     endpoint: Optional[str] = None  # required for local providers (e.g. Ollama)
+    transport: Optional[str] = None  # frontier only: "cli" | "api"; None = use ALR_FRONTIER_TRANSPORT env (default "cli")
 
 
 class ModelRegistry:
@@ -43,6 +44,7 @@ class ModelRegistry:
                 latency_ms_p50=int(cfg.get("latency_ms_p50", 1000)),
                 privacy=cfg.get("privacy", "cloud"),
                 endpoint=cfg.get("endpoint"),
+                transport=cfg.get("transport"),
             )
 
         self._capability_matrix: Dict[str, Dict[str, float]] = raw.get("capability_matrix", {})

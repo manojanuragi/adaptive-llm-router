@@ -18,6 +18,9 @@ models:
     cost_per_1k_tokens: 0.006           # placeholder — set to your real rate card
     latency_ms_p50: 2500
     privacy: cloud
+    # transport: cli                    # optional: "cli" (default, needs `claude login`)
+                                         # or "api" (needs ANTHROPIC_API_KEY, works headlessly).
+                                         # Unset = use the ALR_FRONTIER_TRANSPORT env var.
 
 # Rough capability matrix used by the rule-based router (section 15).
 # Keys MUST match the category names TaskAnalyzer produces (see

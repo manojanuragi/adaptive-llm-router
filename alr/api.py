@@ -44,6 +44,7 @@ from pydantic import BaseModel, Field
 from .analyzer import TaskAnalyzer
 from .auth import build_fastapi_dependency, load_api_keys_from_env
 from .evaluation import compute_evaluation_metrics
+from .frontier_llm import FrontierAuthError, validate_frontier_auth
 from .logging_config import configure_logging, get_logger
 from .models import Privacy, Risk, TaskEnvelope
 from .pipeline import Pipeline
@@ -95,6 +96,13 @@ async def lifespan(app: FastAPI):
         )
 
     _registry = ModelRegistry()
+
+    try:
+        validate_frontier_auth(_registry)
+    except FrontierAuthError as e:
+        log.error(f"refusing to start: {e}")
+        raise
+
     _analyzer = TaskAnalyzer()
     _router = AdaptiveRouter(_registry)
     _pipeline = Pipeline(policy_engine=PolicyEngine())
@@ -141,18 +149,18 @@ class TaskRequest(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
-def _to_envelope(req: TaskRequest) -> TaskEnvelope:
+def _to_envelope(req: TaskRequest, caller_id: str = "anonymous") -> TaskEnvelope:
     return TaskEnvelope(
         task=req.task, task_type=req.task_type, risk=req.risk, context_tokens=req.context_tokens,
         privacy=req.privacy, latency_budget_ms=req.latency_budget_ms, quality_target=req.quality_target,
-        payload=req.payload,
+        payload=req.payload, caller_id=caller_id,
     )
 
 
 @app.post("/route")
-def route(req: TaskRequest, _key: str = Depends(require_api_key)) -> Dict[str, Any]:
+def route(req: TaskRequest, caller_id: str = Depends(require_api_key)) -> Dict[str, Any]:
     """Dry run — section 29 example. Returns the decision without executing."""
-    envelope = _to_envelope(req)
+    envelope = _to_envelope(req, caller_id)
     features = _analyzer.analyze(envelope)
     decision = _router.route(envelope, features)
     return {
@@ -163,11 +171,14 @@ def route(req: TaskRequest, _key: str = Depends(require_api_key)) -> Dict[str, A
 
 
 @app.post("/execute")
-async def execute(req: TaskRequest, _key: str = Depends(require_api_key)) -> Dict[str, Any]:
+async def execute(req: TaskRequest, caller_id: str = Depends(require_api_key)) -> Dict[str, Any]:
     """Full pipeline: policy check + route + execute + validate + escalate + trace.
     Runs async so a slow local/frontier call doesn't block other requests.
+    Each request is attributed to the caller's identity (from ALR_API_KEYS'
+    optional `key:identity` labels — see alr/auth.py) in the trace store,
+    so usage can be broken down per caller via GET /metrics/full.
     """
-    envelope = _to_envelope(req)
+    envelope = _to_envelope(req, caller_id)
     try:
         result = await _pipeline.run_async(envelope)
     except Exception as e:  # noqa: BLE001 — never leak internals to the client
@@ -179,6 +190,9 @@ async def execute(req: TaskRequest, _key: str = Depends(require_api_key)) -> Dic
         "output": result.output, "confidence": result.confidence, "success": result.success,
         "escalated": result.escalated, "escalation_reason": result.escalation_reason,
         "latency_ms": result.latency_ms, "cost": result.cost,
+        "baseline_cost": result.baseline_cost, "cost_saved": result.cost_saved,
+        "cost_saved_pct": result.cost_saved_pct, "tokens_saved": result.tokens_saved,
+        "tokens_saved_pct": result.tokens_saved_pct, "caller_id": caller_id,
     }
 
 

@@ -108,6 +108,55 @@ class Pipeline:
         tokens_after = len(summary_json.split())
         return prompt, tokens_before, tokens_after
 
+    def _compute_savings(self, result: ExecutionResult) -> None:
+        """Populates result.baseline_cost / cost_saved / cost_saved_pct /
+        tokens_saved / tokens_saved_pct in place, for the token/cost
+        savings tracking surfaced by /execute and rolled up in
+        alr/evaluation.py + alr/tracing.py. This is a proxy, not measured
+        ground truth (same honesty caveat as the rest of this MVP's
+        economics — see the README's "Honest limitations"):
+
+        - Tool/local responses never reached the frontier model at all, so
+          the *entire* frontier-equivalent cost for the same token volume
+          (estimated via the registry's frontier `cost_per_1k_tokens` rate)
+          counts as saved.
+        - Frontier responses (direct or escalated) already paid frontier
+          cost — the only savings available there are from the Context
+          Firewall (sections 12/23) shrinking the prompt before it was
+          sent, so savings are computed from context_tokens_before/after
+          when present, and zero otherwise.
+        """
+        cloud_models = self.registry.cloud_capable_models()
+        frontier_rate = cloud_models[0].cost_per_1k_tokens if cloud_models else 0.0
+
+        if result.route in (RouteTier.LOCAL, RouteTier.TOOL) and not result.escalated:
+            total_tokens = result.input_tokens + result.output_tokens
+            baseline = round(total_tokens / 1000.0 * frontier_rate, 6)
+            result.baseline_cost = baseline
+            result.cost_saved = round(baseline - result.cost, 6)
+            result.cost_saved_pct = round((result.cost_saved / baseline) * 100, 2) if baseline > 0 else 0.0
+            result.tokens_saved = total_tokens
+            result.tokens_saved_pct = 100.0 if total_tokens > 0 else 0.0
+            return
+
+        if (
+            result.context_tokens_before
+            and result.context_tokens_after is not None
+            and result.context_tokens_before > 0
+        ):
+            tokens_saved = max(0, result.context_tokens_before - result.context_tokens_after)
+            uncompressed_equiv_tokens = result.input_tokens + tokens_saved
+            baseline = (
+                round(uncompressed_equiv_tokens / 1000.0 * frontier_rate, 6) if frontier_rate else result.cost
+            )
+            result.baseline_cost = baseline
+            result.cost_saved = round(baseline - result.cost, 6)
+            result.cost_saved_pct = round(tokens_saved / result.context_tokens_before * 100, 2)
+            result.tokens_saved = tokens_saved
+            result.tokens_saved_pct = result.cost_saved_pct
+        else:
+            result.baseline_cost = result.cost
+
     def _denied_result(self, envelope: TaskEnvelope, decision: RouteDecision, exc: PolicyDeniedError) -> ExecutionResult:
         return ExecutionResult(
             trace_id=envelope.trace_id, route=decision.route, model=decision.model,
@@ -130,7 +179,7 @@ class Pipeline:
             decision = self.router.route(envelope, self.analyzer.analyze(envelope))
             result = self._denied_result(envelope, decision, e)
             result.latency_ms = int((time.time() - start) * 1000)
-            self.trace_store.record(decision=decision, result=result, task_type=None, risk=envelope.risk.value, complexity=None)
+            self.trace_store.record(decision=decision, result=result, task_type=None, risk=envelope.risk.value, complexity=None, caller_id=envelope.caller_id)
             return result
 
         result = self._execute(envelope, decision)
@@ -159,10 +208,12 @@ class Pipeline:
                     escalated_result.escalation_reason = "; ".join(validation.reasons)
                     result = escalated_result
 
+        self._compute_savings(result)
         result.latency_ms = int((time.time() - start) * 1000)
         self.trace_store.record(
             decision=decision, result=result, task_type=features.category,
             risk=envelope.risk.value, complexity=features.complexity,
+            caller_id=envelope.caller_id,
         )
         return result
 
@@ -231,7 +282,7 @@ class Pipeline:
             decision = self.router.route(envelope, self.analyzer.analyze(envelope))
             result = self._denied_result(envelope, decision, e)
             result.latency_ms = int((time.time() - start) * 1000)
-            self.trace_store.record(decision=decision, result=result, task_type=None, risk=envelope.risk.value, complexity=None)
+            self.trace_store.record(decision=decision, result=result, task_type=None, risk=envelope.risk.value, complexity=None, caller_id=envelope.caller_id)
             return result
 
         result = await self._execute_async(envelope, decision)
@@ -260,10 +311,12 @@ class Pipeline:
                     escalated_result.escalation_reason = "; ".join(validation.reasons)
                     result = escalated_result
 
+        self._compute_savings(result)
         result.latency_ms = int((time.time() - start) * 1000)
         self.trace_store.record(
             decision=decision, result=result, task_type=features.category,
             risk=envelope.risk.value, complexity=features.complexity,
+            caller_id=envelope.caller_id,
         )
         return result
 

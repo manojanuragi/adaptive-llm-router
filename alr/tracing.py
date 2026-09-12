@@ -53,6 +53,40 @@ _V2_COLUMNS = [
     ("context_tokens_after", "INTEGER"),
 ]
 
+# v3: per-response token/cost savings tracking (Pipeline._compute_savings).
+_V3_COLUMNS = [
+    ("baseline_cost", "REAL"),
+    ("cost_saved", "REAL"),
+    ("cost_saved_pct", "REAL"),
+    ("tokens_saved", "INTEGER"),
+    ("tokens_saved_pct", "REAL"),
+]
+
+# v4: per-caller identity (alr/auth.py's ALR_API_KEYS `key:identity`
+# labels — never the raw API key) for per-caller usage tracking.
+_V4_COLUMNS = [
+    ("caller_id", "TEXT"),
+]
+
+
+def _per_caller_usage(rows: list) -> dict:
+    """{caller_id: {"requests": N, "cost": total, "cost_saved": total}} —
+    shared by both trace store backends' summary_metrics(). Rows from
+    before the v4 caller_id column (or an unlabeled ALR_API_KEYS entry)
+    fall under "anonymous", matching record()'s own default.
+    """
+    usage: dict = {}
+    for r in rows:
+        caller = r.get("caller_id") or "anonymous"
+        bucket = usage.setdefault(caller, {"requests": 0, "cost": 0.0, "cost_saved": 0.0})
+        bucket["requests"] += 1
+        bucket["cost"] += r.get("actual_cost") or 0.0
+        bucket["cost_saved"] += r.get("cost_saved") or 0.0
+    for bucket in usage.values():
+        bucket["cost"] = round(bucket["cost"], 6)
+        bucket["cost_saved"] = round(bucket["cost_saved"], 6)
+    return usage
+
 
 class TraceStore:
     """SQLite-backed trace store, WAL-mode for better read/write
@@ -70,7 +104,7 @@ class TraceStore:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute(SCHEMA)
             existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(traces)").fetchall()}
-            for name, sql_type in _V2_COLUMNS:
+            for name, sql_type in _V2_COLUMNS + _V3_COLUMNS + _V4_COLUMNS:
                 if name not in existing_cols:
                     conn.execute(f"ALTER TABLE traces ADD COLUMN {name} {sql_type}")
 
@@ -91,6 +125,7 @@ class TraceStore:
         task_type: Optional[str] = None,
         risk: Optional[str] = None,
         complexity: Optional[float] = None,
+        caller_id: Optional[str] = None,
     ) -> None:
         with self._conn() as conn:
             conn.execute(
@@ -98,8 +133,10 @@ class TraceStore:
                 (trace_id, task_type, complexity, risk, selected_route, selected_model,
                  alternatives, estimated_cost, actual_cost, estimated_quality, confidence,
                  success, escalated, escalation_reason, latency_ms, input_tokens,
-                 output_tokens, context_tokens_before, context_tokens_after, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 output_tokens, context_tokens_before, context_tokens_after,
+                 baseline_cost, cost_saved, cost_saved_pct, tokens_saved, tokens_saved_pct,
+                 caller_id, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     decision.trace_id,
                     task_type,
@@ -120,6 +157,12 @@ class TraceStore:
                     result.output_tokens,
                     result.context_tokens_before,
                     result.context_tokens_after,
+                    result.baseline_cost,
+                    result.cost_saved,
+                    result.cost_saved_pct,
+                    result.tokens_saved,
+                    result.tokens_saved_pct,
+                    caller_id or "anonymous",
                     time.time(),
                 ),
             )
@@ -153,6 +196,9 @@ class TraceStore:
         escalated = sum(1 for r in rows if r["escalated"])
         successes = sum(1 for r in rows if r["success"])
         total_cost = sum(r["actual_cost"] or 0 for r in rows)
+        total_baseline_cost = sum(r["baseline_cost"] or 0 for r in rows)
+        total_cost_saved = sum(r["cost_saved"] or 0 for r in rows)
+        total_tokens_saved = sum(r["tokens_saved"] or 0 for r in rows)
 
         return {
             "total_requests": total,
@@ -163,6 +209,11 @@ class TraceStore:
             "task_success_rate": round(successes / total, 3),
             "total_cost": round(total_cost, 4),
             "cost_per_successful_task": round(total_cost / successes, 6) if successes else None,
+            "total_baseline_cost": round(total_baseline_cost, 4),
+            "total_cost_saved": round(total_cost_saved, 4),
+            "cost_saved_pct": round(total_cost_saved / total_baseline_cost * 100, 2) if total_baseline_cost else 0.0,
+            "total_tokens_saved": total_tokens_saved,
+            "usage_by_caller": _per_caller_usage(rows),
         }
 
 
@@ -210,22 +261,27 @@ class PostgresTraceStore:
             conn.execute("SELECT pg_advisory_lock(%s)", (_SCHEMA_LOCK_ID,))
             try:
                 conn.execute(POSTGRES_SCHEMA)
-                for name, sql_type in _V2_COLUMNS:
+                for name, sql_type in _V2_COLUMNS + _V3_COLUMNS + _V4_COLUMNS:
                     conn.execute(f"ALTER TABLE traces ADD COLUMN IF NOT EXISTS {name} {sql_type}")
                 conn.commit()
             finally:
                 conn.execute("SELECT pg_advisory_unlock(%s)", (_SCHEMA_LOCK_ID,))
                 conn.commit()
 
-    def record(self, decision: RouteDecision, result: ExecutionResult, task_type=None, risk=None, complexity=None) -> None:
+    def record(
+        self, decision: RouteDecision, result: ExecutionResult, task_type=None, risk=None,
+        complexity=None, caller_id=None,
+    ) -> None:
         with self._psycopg.connect(self.dsn) as conn:
             conn.execute(
                 """INSERT INTO traces
                 (trace_id, task_type, complexity, risk, selected_route, selected_model,
                  alternatives, estimated_cost, actual_cost, estimated_quality, confidence,
                  success, escalated, escalation_reason, latency_ms, input_tokens,
-                 output_tokens, context_tokens_before, context_tokens_after, created_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 output_tokens, context_tokens_before, context_tokens_after,
+                 baseline_cost, cost_saved, cost_saved_pct, tokens_saved, tokens_saved_pct,
+                 caller_id, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (trace_id) DO UPDATE SET
                     success = EXCLUDED.success,
                     confidence = EXCLUDED.confidence,
@@ -235,13 +291,19 @@ class PostgresTraceStore:
                     latency_ms = EXCLUDED.latency_ms,
                     input_tokens = EXCLUDED.input_tokens,
                     output_tokens = EXCLUDED.output_tokens,
-                    context_tokens_after = EXCLUDED.context_tokens_after""",
+                    context_tokens_after = EXCLUDED.context_tokens_after,
+                    baseline_cost = EXCLUDED.baseline_cost,
+                    cost_saved = EXCLUDED.cost_saved,
+                    cost_saved_pct = EXCLUDED.cost_saved_pct,
+                    tokens_saved = EXCLUDED.tokens_saved,
+                    tokens_saved_pct = EXCLUDED.tokens_saved_pct""",
                 (
                     decision.trace_id, task_type, complexity, risk, decision.route.value, decision.model,
                     json.dumps(decision.alternatives), decision.estimated_cost, result.cost, decision.confidence,
                     result.confidence, int(result.success), int(result.escalated), result.escalation_reason,
                     result.latency_ms, result.input_tokens, result.output_tokens, result.context_tokens_before,
-                    result.context_tokens_after, time.time(),
+                    result.context_tokens_after, result.baseline_cost, result.cost_saved, result.cost_saved_pct,
+                    result.tokens_saved, result.tokens_saved_pct, caller_id or "anonymous", time.time(),
                 ),
             )
             conn.commit()
@@ -264,6 +326,9 @@ class PostgresTraceStore:
         escalated = sum(1 for r in rows if r["escalated"])
         successes = sum(1 for r in rows if r["success"])
         total_cost = sum(r["actual_cost"] or 0 for r in rows)
+        total_baseline_cost = sum(r["baseline_cost"] or 0 for r in rows)
+        total_cost_saved = sum(r["cost_saved"] or 0 for r in rows)
+        total_tokens_saved = sum(r["tokens_saved"] or 0 for r in rows)
         return {
             "total_requests": total,
             "frontier_requests": frontier,
@@ -273,6 +338,11 @@ class PostgresTraceStore:
             "task_success_rate": round(successes / total, 3),
             "total_cost": round(total_cost, 4),
             "cost_per_successful_task": round(total_cost / successes, 6) if successes else None,
+            "total_baseline_cost": round(total_baseline_cost, 4),
+            "total_cost_saved": round(total_cost_saved, 4),
+            "cost_saved_pct": round(total_cost_saved / total_baseline_cost * 100, 2) if total_baseline_cost else 0.0,
+            "total_tokens_saved": total_tokens_saved,
+            "usage_by_caller": _per_caller_usage(rows),
         }
 
 

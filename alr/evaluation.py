@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .models import ExecutionResult, RouteDecision, RouteTier, TaskEnvelope
 from .registry import ModelRegistry
+from .tracing import _per_caller_usage
 
 
 # ---------------------------------------------------------------------
@@ -47,6 +48,15 @@ class EvaluationMetrics:
     frontier_tokens_per_task: Optional[float]
     local_tokens_total: int
     total_tokens_per_task: Optional[float]
+
+    # Savings tracking (Pipeline._compute_savings) — what the registry's
+    # frontier model would have cost for the same responses vs. what was
+    # actually spent. A proxy, not measured ground truth — see README.
+    total_baseline_cost: float
+    total_cost_saved: float
+    cost_saved_pct: Optional[float]
+    total_tokens_saved: int
+    tokens_saved_pct: Optional[float]
 
     # Performance (section 17)
     latency_p50_ms: Optional[float]
@@ -73,6 +83,9 @@ class EvaluationMetrics:
 
     # Breakdown
     requests_by_route: Dict[str, int]
+    # Per-caller usage (alr/auth.py's ALR_API_KEYS `key:identity` labels —
+    # never the raw API key). "anonymous" for unauthenticated/unlabeled traffic.
+    usage_by_caller: Dict[str, Dict[str, float]]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -180,11 +193,14 @@ def compute_evaluation_metrics(
             frontier_success_rate=None, model_failure_rate=None, total_cost=0.0,
             cost_per_task=None, cost_per_successful_task=None, frontier_tokens_total=0,
             frontier_tokens_per_task=None, local_tokens_total=0, total_tokens_per_task=None,
+            total_baseline_cost=0.0, total_cost_saved=0.0, cost_saved_pct=None,
+            total_tokens_saved=0, tokens_saved_pct=None,
             latency_p50_ms=None, latency_p95_ms=None, latency_p50_ms_by_route={},
             latency_p95_ms_by_route={}, time_to_successful_completion_p50_ms=None,
             escalation_rate=None, false_local_rate=None, false_frontier_rate=None,
             correct_routing_rate=None, context_compression_ratio=None, context_samples=0,
             quality_per_dollar=None, quality_per_second=None, requests_by_route={},
+            usage_by_caller={},
         )
 
     successes = [r for r in rows if r["success"]]
@@ -206,6 +222,10 @@ def compute_evaluation_metrics(
 
     frontier_tokens_total = sum((r.get("input_tokens") or 0) + (r.get("output_tokens") or 0) for r in frontier_rows)
     local_tokens_total = sum((r.get("input_tokens") or 0) + (r.get("output_tokens") or 0) for r in local_rows)
+
+    total_baseline_cost = sum(r.get("baseline_cost") or 0.0 for r in rows)
+    total_cost_saved = sum(r.get("cost_saved") or 0.0 for r in rows)
+    total_tokens_saved = sum(r.get("tokens_saved") or 0 for r in rows)
 
     all_latencies = [r["latency_ms"] for r in rows if r.get("latency_ms") is not None]
     latency_p50_ms_by_route = {}
@@ -255,6 +275,17 @@ def compute_evaluation_metrics(
         frontier_tokens_per_task=round(_safe_div(frontier_tokens_total, len(frontier_rows)), 2) if frontier_rows else None,
         local_tokens_total=local_tokens_total,
         total_tokens_per_task=round(_safe_div(frontier_tokens_total + local_tokens_total, total), 2),
+        total_baseline_cost=round(total_baseline_cost, 6),
+        total_cost_saved=round(total_cost_saved, 6),
+        cost_saved_pct=(
+            round(total_cost_saved / total_baseline_cost * 100, 2) if total_baseline_cost else None
+        ),
+        total_tokens_saved=total_tokens_saved,
+        tokens_saved_pct=(
+            round(total_tokens_saved / (total_tokens_saved + frontier_tokens_total + local_tokens_total) * 100, 2)
+            if (total_tokens_saved + frontier_tokens_total + local_tokens_total)
+            else None
+        ),
         latency_p50_ms=_percentile(all_latencies, 50),
         latency_p95_ms=_percentile(all_latencies, 95),
         latency_p50_ms_by_route=latency_p50_ms_by_route,
@@ -271,6 +302,7 @@ def compute_evaluation_metrics(
         quality_per_dollar=quality_per_dollar,
         quality_per_second=quality_per_second,
         requests_by_route=requests_by_route,
+        usage_by_caller=_per_caller_usage(rows),
     )
 
 
@@ -326,6 +358,9 @@ def _row_from_result(
         "latency_ms": result.latency_ms, "input_tokens": result.input_tokens,
         "output_tokens": result.output_tokens, "context_tokens_before": result.context_tokens_before,
         "context_tokens_after": result.context_tokens_after,
+        "baseline_cost": result.baseline_cost, "cost_saved": result.cost_saved,
+        "cost_saved_pct": result.cost_saved_pct, "tokens_saved": result.tokens_saved,
+        "tokens_saved_pct": result.tokens_saved_pct,
     }
 
 
@@ -390,6 +425,7 @@ def run_baseline(
             )
         else:
             result = pipeline._execute(envelope, decision)
+        pipeline._compute_savings(result)
         rows.append(_row_from_result(decision, result, features.category, envelope.risk.value, features.complexity))
 
     if mode == "adaptive":

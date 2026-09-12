@@ -1,8 +1,8 @@
-"""Auth — API key verification.
+"""Auth — API key verification, with per-caller identity for usage tracking.
 
-Core logic (`verify_api_key`) is stdlib-only and unit-testable without
-FastAPI. `require_api_key` at the bottom is the FastAPI dependency that
-wraps it for use in api.py.
+Core logic (`verify_api_key`, `load_api_keys_from_env`) is stdlib-only
+and unit-testable without FastAPI. `require_api_key` at the bottom is the
+FastAPI dependency that wraps it for use in api.py.
 
 This is deliberately simple (static key set via env var), matching the
 rest of the MVP's philosophy: correct and honest about what it is, not
@@ -13,18 +13,42 @@ from __future__ import annotations
 
 import hmac
 import os
-from typing import Iterable, Optional, Set
+from typing import Dict, Iterable, Optional
 
 
-def load_api_keys_from_env(var_name: str = "ALR_API_KEYS") -> Set[str]:
-    """Comma-separated keys, e.g. ALR_API_KEYS=key1,key2"""
+def load_api_keys_from_env(var_name: str = "ALR_API_KEYS") -> Dict[str, str]:
+    """Comma-separated keys, each optionally labeled with a caller
+    identity: `ALR_API_KEYS=key1:alice,key2:bob`. A plain key with no
+    `:label` (`ALR_API_KEYS=key1,key2`, the original format) is still
+    accepted — its identity just defaults to the key itself.
+
+    The label is a per-caller identity used only for usage tracking (see
+    `ExecutionResult.caller_id` / `TraceStore` — it lets you see
+    `requests_by_caller`/cost-by-caller breakdowns without every caller
+    sharing one anonymous bucket). Pick a non-sensitive label — a name, a
+    GitHub username, a team name — never something secret, since it's
+    stored in trace data and returned in API responses.
+
+    Returns a dict of {key: identity} rather than a bare set so callers
+    can look up who a validated key belongs to.
+    """
     raw = os.environ.get(var_name, "")
-    return {k.strip() for k in raw.split(",") if k.strip()}
+    keys: Dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        key, sep, identity = entry.partition(":")
+        key = key.strip()
+        keys[key] = identity.strip() if sep and identity.strip() else key
+    return keys
 
 
 def verify_api_key(provided: Optional[str], valid_keys: Iterable[str]) -> bool:
     """Constant-time comparison against each valid key to avoid leaking
-    key length/prefix via timing side channels.
+    key length/prefix via timing side channels. `valid_keys` may be a
+    dict (as returned by `load_api_keys_from_env`) — iterating a dict
+    yields its keys, so this works unchanged either way.
     """
     valid_keys = list(valid_keys)
     if not valid_keys:
@@ -37,6 +61,16 @@ def verify_api_key(provided: Optional[str], valid_keys: Iterable[str]) -> bool:
     return any(hmac.compare_digest(provided, k) for k in valid_keys)
 
 
+def resolve_caller_id(provided: Optional[str], valid_keys: Dict[str, str]) -> str:
+    """The label to attach to this request's trace/usage data. Never
+    returns the raw secret key itself — only its configured identity
+    label, or "anonymous" when auth is off or the key carries no label.
+    """
+    if not valid_keys or not provided:
+        return "anonymous"
+    return valid_keys.get(provided, "anonymous")
+
+
 # --- FastAPI-specific wrapper (only imported by api.py) ---------------
 def build_fastapi_dependency():
     from fastapi import Header, HTTPException, status
@@ -46,6 +80,6 @@ def build_fastapi_dependency():
     async def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> str:
         if not verify_api_key(x_api_key, valid_keys):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key")
-        return x_api_key or "anonymous"
+        return resolve_caller_id(x_api_key, valid_keys)
 
     return require_api_key

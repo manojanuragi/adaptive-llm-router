@@ -45,6 +45,10 @@ class TaskEnvelope:
     payload: Dict[str, Any] = field(default_factory=dict)
     available_models: Optional[List[str]] = None
     trace_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    # Per-caller identity for usage tracking (alr/auth.py resolves this
+    # from ALR_API_KEYS' optional `key:identity` labels) — never the raw
+    # API key itself. "anonymous" when auth is off or unset.
+    caller_id: str = "anonymous"
 
 
 @dataclass
@@ -87,3 +91,12 @@ class ExecutionResult:
     output_tokens: int = 0
     context_tokens_before: Optional[int] = None
     context_tokens_after: Optional[int] = None
+    # Savings tracking (see Pipeline._compute_savings): what the registry's
+    # frontier model would have cost for this same response, and how much
+    # of that was actually avoided. A proxy, not measured ground truth —
+    # see the README's Honest limitations.
+    baseline_cost: float = 0.0
+    cost_saved: float = 0.0
+    cost_saved_pct: float = 0.0
+    tokens_saved: int = 0
+    tokens_saved_pct: float = 0.0

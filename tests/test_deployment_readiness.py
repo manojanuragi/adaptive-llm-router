@@ -13,7 +13,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from alr.auth import load_api_keys_from_env, verify_api_key
+from alr.auth import load_api_keys_from_env, resolve_caller_id, verify_api_key
 from alr.frontier_llm import FrontierLLMResponse
 from alr.local_llm import LocalLLMResponse, LocalLLMUnavailable
 from alr.models import RouteTier, TaskEnvelope
@@ -67,7 +67,19 @@ class TestAuth(unittest.TestCase):
 
     def test_load_keys_from_env(self):
         with mock.patch.dict(os.environ, {"ALR_API_KEYS": "a, b ,c"}):
-            self.assertEqual(load_api_keys_from_env(), {"a", "b", "c"})
+            self.assertEqual(load_api_keys_from_env(), {"a": "a", "b": "b", "c": "c"})
+
+    def test_load_keys_from_env_with_labeled_identities(self):
+        with mock.patch.dict(os.environ, {"ALR_API_KEYS": "key1:alice, key2:bob"}):
+            self.assertEqual(load_api_keys_from_env(), {"key1": "alice", "key2": "bob"})
+
+    def test_resolve_caller_id_returns_label_not_raw_key(self):
+        keys = {"key1": "alice"}
+        self.assertEqual(resolve_caller_id("key1", keys), "alice")
+
+    def test_resolve_caller_id_falls_back_to_anonymous(self):
+        self.assertEqual(resolve_caller_id("unknown", {"key1": "alice"}), "anonymous")
+        self.assertEqual(resolve_caller_id(None, {}), "anonymous")
 
 
 class TestRateLimiter(unittest.TestCase):
